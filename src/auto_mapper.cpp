@@ -463,6 +463,44 @@ private:
         queue<unsigned int> bfs;
 
         unsigned int pos = costmap_.getIndex(mx, my);
+
+        // If the robot's cell is not FREE_SPACE (common with VDB+patchworkpp since the
+        // robot's immediate vicinity has no lidar rays), search outward for the nearest
+        // free cell and seed the BFS from there instead.
+        if (map_[pos] != FREE_SPACE) {
+            queue<unsigned int> seed_bfs;
+            vector<bool> seed_visited(size_x_ * size_y_, false);
+            seed_bfs.push(pos);
+            seed_visited[pos] = true;
+            bool found_free = false;
+            // Search up to 200 cells (~20m at 0.1m/cell) for the nearest free cell.
+            const unsigned int MAX_SEED_SEARCH = 200 * 200;
+            unsigned int seed_iters = 0;
+            while (!seed_bfs.empty() && seed_iters < MAX_SEED_SEARCH) {
+                unsigned int idx = seed_bfs.front();
+                seed_bfs.pop();
+                ++seed_iters;
+                for (unsigned int nbr : nhood8(idx)) {
+                    if (seed_visited[nbr]) continue;
+                    seed_visited[nbr] = true;
+                    if (map_[nbr] == FREE_SPACE) {
+                        pos = nbr;
+                        found_free = true;
+                        break;
+                    }
+                    if (map_[nbr] == NO_INFORMATION) {
+                        seed_bfs.push(nbr);
+                    }
+                }
+                if (found_free) break;
+            }
+            if (!found_free) {
+                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                    "Robot vicinity is all unknown — no free cells reachable yet.");
+                return frontier_list;
+            }
+        }
+
         bfs.push(pos);
         visited_flag[bfs.front()] = true;
 
