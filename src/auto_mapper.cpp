@@ -123,6 +123,7 @@ private:
     Subscription<Odometry>::SharedPtr   odomSubscription_;   // nav_msgs/Odometry (odom_topic)
     Subscription<PoseStamped>::SharedPtr poseSubscription_;  // geometry_msgs/PoseStamped (pose_topic)
     PoseWithCovarianceStamped::UniquePtr pose_;
+    bool hasNavigated_ = false;  // true once at least one goal has been accepted
 
     array<unsigned char, 256> costTranslationTable_ = initTranslationTable();
 
@@ -264,7 +265,13 @@ private:
         if (isExploring_) { return; }
         auto frontiers = findFrontiers();
         if (frontiers.empty()) {
-            RCLCPP_WARN(get_logger(), "NO BOUNDARIES FOUND!!");
+            if (!hasNavigated_) {
+                // Map too sparse to find frontiers yet — wait for more scans.
+                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                    "No frontiers found yet — waiting for map to populate...");
+                return;
+            }
+            RCLCPP_WARN(get_logger(), "No frontiers remaining — exploration complete.");
             stop();
             return;
         }
@@ -285,6 +292,7 @@ private:
             if (goal_handle) {
                 RCLCPP_INFO(get_logger(), "Goal accepted by server, waiting for result");
                 isExploring_ = true;
+                hasNavigated_ = true;
             } else {
                 RCLCPP_ERROR(get_logger(), "Goal was rejected by server");
             }
