@@ -17,6 +17,7 @@
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "nav2_msgs/srv/save_map.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 #include "nav2_costmap_2d/costmap_2d.hpp"
 #include "nav2_costmap_2d/cost_values.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
@@ -28,6 +29,7 @@ using std::placeholders::_1;
 using geometry_msgs::msg::PoseWithCovarianceStamped;
 using geometry_msgs::msg::PoseStamped;
 using geometry_msgs::msg::Point;
+using nav_msgs::msg::Odometry;
 using nav_msgs::msg::OccupancyGrid;
 using nav2_msgs::action::NavigateToPose;
 using visualization_msgs::msg::MarkerArray;
@@ -56,13 +58,30 @@ public:
         RCLCPP_INFO(get_logger(), "AutoMapper started...");
 
         // Declare and get parameters
-        declare_parameter<string>("map_topic", "/map");
-        declare_parameter<string>("pose_topic", "/pose");
-        get_parameter("map_topic", mapTopic_);
-        get_parameter("pose_topic", poseTopic_);
+        declare_parameter<string>("map_topic",   "/map");
+        declare_parameter<string>("odom_topic",  "/localization/odometry/odom");
+        declare_parameter<string>("pose_topic",  "");   // optional PoseStamped alternative
+        declare_parameter<string>("map_path",    "/tmp/maps");
+        get_parameter("map_topic",   mapTopic_);
+        get_parameter("odom_topic",  odomTopic_);
+        get_parameter("pose_topic",  poseTopic_);
+        get_parameter("map_path",    mapPath_);
 
-        poseSubscription_ = create_subscription<PoseStamped>(
-                poseTopic_, 10, bind(&AutoMapper::poseTopicCallback, this, _1));
+        // Subscribe to Odometry if odom_topic is non-empty (primary source)
+        if (!odomTopic_.empty()) {
+            odomSubscription_ = create_subscription<Odometry>(
+                    odomTopic_, 10, bind(&AutoMapper::odomCallback, this, _1));
+            RCLCPP_INFO(get_logger(), "Subscribing to Odometry on '%s'.", odomTopic_.c_str());
+        }
+        // Subscribe to PoseStamped if pose_topic is non-empty (alternative source)
+        if (!poseTopic_.empty()) {
+            poseSubscription_ = create_subscription<PoseStamped>(
+                    poseTopic_, 10, bind(&AutoMapper::poseCallback, this, _1));
+            RCLCPP_INFO(get_logger(), "Subscribing to PoseStamped on '%s'.", poseTopic_.c_str());
+        }
+        if (odomTopic_.empty() && poseTopic_.empty()) {
+            RCLCPP_ERROR(get_logger(), "Neither odom_topic nor pose_topic is set — no pose source!");
+        }
 
         mapSubscription_ = create_subscription<OccupancyGrid>(
                 mapTopic_, 10, bind(&AutoMapper::updateFullMap, this, _1));
@@ -72,10 +91,17 @@ public:
                 this,
                 "/navigate_to_pose");
 
-        poseNavigator_->wait_for_action_server();
-        RCLCPP_INFO(get_logger(), "AutoMapper poseNavigator_");
-        declare_parameter("map_path", rclcpp::PARAMETER_STRING);
-        get_parameter("map_path", mapPath_);
+        // Wait for the navigate_to_pose action server, but yield to the executor
+        // so the node can be interrupted (e.g. Ctrl-C) while waiting.
+        while (!poseNavigator_->wait_for_action_server(1s)) {
+            if (!rclcpp::ok()) {
+                RCLCPP_ERROR(get_logger(), "Interrupted while waiting for navigate_to_pose action server.");
+                return;
+            }
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                "Waiting for navigate_to_pose action server...");
+        }
+        RCLCPP_INFO(get_logger(), "AutoMapper connected to navigate_to_pose action server.");
     }
 
 private:
@@ -91,10 +117,11 @@ private:
     int markerId_;
     string mapPath_;
     string mapTopic_;
+    string odomTopic_;
     string poseTopic_;
 
-
-    Subscription<PoseStamped>::SharedPtr poseSubscription_;
+    Subscription<Odometry>::SharedPtr   odomSubscription_;   // nav_msgs/Odometry (odom_topic)
+    Subscription<PoseStamped>::SharedPtr poseSubscription_;  // geometry_msgs/PoseStamped (pose_topic)
     PoseWithCovarianceStamped::UniquePtr pose_;
 
     array<unsigned char, 256> costTranslationTable_ = initTranslationTable();
@@ -120,17 +147,28 @@ private:
     struct Frontier {
         Point centroid;
         vector<Point> points;
-        string getKey() const{to_string(centroid.x) + "," + to_string(centroid.y);}
+        string getKey() const { return to_string(centroid.x) + "," + to_string(centroid.y); }
     };
 
-    void poseTopicCallback(PoseStamped::UniquePtr msg) {
+    // Called for nav_msgs/Odometry messages (odom_topic).
+    void odomCallback(Odometry::UniquePtr msg) {
         if (pose_ == nullptr) {
-            RCLCPP_INFO(get_logger(), "Initial robot pose received on topic '%s'.", poseTopic_.c_str());
+            RCLCPP_INFO(get_logger(), "Initial robot pose received on odom_topic '%s'.", odomTopic_.c_str());
         }
         pose_ = std::make_unique<PoseWithCovarianceStamped>();
         pose_->header = msg->header;
-        pose_->pose.pose = msg->pose;
-        // Covariance is not provided by PoseStamped, so it remains default-initialized (zeros)
+        pose_->pose   = msg->pose;  // PoseWithCovariance — includes covariance
+    }
+
+    // Called for geometry_msgs/PoseStamped messages (pose_topic).
+    void poseCallback(PoseStamped::UniquePtr msg) {
+        if (pose_ == nullptr) {
+            RCLCPP_INFO(get_logger(), "Initial robot pose received on pose_topic '%s'.", poseTopic_.c_str());
+        }
+        pose_ = std::make_unique<PoseWithCovarianceStamped>();
+        pose_->header      = msg->header;
+        pose_->pose.pose   = msg->pose;
+        // Covariance is unavailable from PoseStamped; remains zero-initialized.
     }
 
     void updateFullMap(OccupancyGrid::UniquePtr occupancyGrid) {
@@ -214,6 +252,7 @@ private:
 
     void stop() {
         RCLCPP_INFO(get_logger(), "Stopped...");
+        odomSubscription_.reset();
         poseSubscription_.reset();
         mapSubscription_.reset();
         poseNavigator_->async_cancel_all_goals();
@@ -239,7 +278,9 @@ private:
         RCLCPP_INFO(get_logger(), "Sending goal %f,%f", frontier.centroid.x, frontier.centroid.y);
 
         auto send_goal_options = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
-        send_goal_options.goal_response_callback = [this, &frontier](
+        // Capture by value: goal_response fires after explore() returns so &frontier
+        // would be a dangling reference.
+        send_goal_options.goal_response_callback = [this](
                 const GoalHandleNavigateToPose::SharedPtr &goal_handle) {
             if (goal_handle) {
                 RCLCPP_INFO(get_logger(), "Goal accepted by server, waiting for result");
