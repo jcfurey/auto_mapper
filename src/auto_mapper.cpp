@@ -301,7 +301,8 @@ private:
         send_goal_options.feedback_callback = [this](
                 const GoalHandleNavigateToPose::SharedPtr &,
                 const std::shared_ptr<const NavigateToPose::Feedback> &feedback) {
-            RCLCPP_INFO(get_logger(), "Distance remaining: %f", feedback->distance_remaining);
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                "Distance remaining: %.2f m", feedback->distance_remaining);
         };
 
         send_goal_options.result_callback = [this](const GoalHandleNavigateToPose::WrappedResult &result) {
@@ -328,13 +329,13 @@ private:
     }
 
     void saveMap() {
-        RCLCPP_INFO(get_logger(), "Requesting to save map using nav2_map_server...");
         auto map_saver_cli = create_client<nav2_msgs::srv::SaveMap>("/map_server/save_map");
 
-        if (!map_saver_cli->wait_for_service(2s)) {
-            RCLCPP_ERROR(get_logger(), "nav2_map_server's save_map service not available.");
+        if (!map_saver_cli->wait_for_service(1s)) {
+            RCLCPP_INFO(get_logger(), "map_saver service not available — skipping map save.");
             return;
         }
+        RCLCPP_INFO(get_logger(), "Saving map to %s ...", mapPath_.c_str());
 
         auto request = std::make_shared<nav2_msgs::srv::SaveMap::Request>();
         request->map_topic = mapTopic_;
