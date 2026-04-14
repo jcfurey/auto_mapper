@@ -8,6 +8,7 @@
 #include <string>
 #include <array>
 #include <fstream>
+#include <algorithm>
 
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -62,10 +63,24 @@ public:
         declare_parameter<string>("odom_topic",  "/localization/odometry/odom");
         declare_parameter<string>("pose_topic",  "");   // optional PoseStamped alternative
         declare_parameter<string>("map_path",    "/tmp/maps");
+        declare_parameter<double>("min_frontier_length_m", 0.25);
+        declare_parameter<double>("min_distance_to_frontier_m", 0.75);
+        declare_parameter<double>("max_distance_to_frontier_m", 40.0);
+        declare_parameter<double>("frontier_size_weight", 1.0);
+        declare_parameter<double>("frontier_distance_weight", 0.35);
+        declare_parameter<double>("frontier_distance_cap_m", 20.0);
+        declare_parameter<int>("min_free_threshold", 4);
         get_parameter("map_topic",   mapTopic_);
         get_parameter("odom_topic",  odomTopic_);
         get_parameter("pose_topic",  poseTopic_);
         get_parameter("map_path",    mapPath_);
+        get_parameter("min_frontier_length_m", min_frontier_length_m_);
+        get_parameter("min_distance_to_frontier_m", min_distance_to_frontier_m_);
+        get_parameter("max_distance_to_frontier_m", max_distance_to_frontier_m_);
+        get_parameter("frontier_size_weight", frontier_size_weight_);
+        get_parameter("frontier_distance_weight", frontier_distance_weight_);
+        get_parameter("frontier_distance_cap_m", frontier_distance_cap_m_);
+        get_parameter("min_free_threshold", min_free_threshold_);
 
         // Subscribe to Odometry if odom_topic is non-empty (primary source)
         if (!odomTopic_.empty()) {
@@ -105,15 +120,20 @@ public:
     }
 
 private:
-    const double MIN_FRONTIER_DENSITY = 0.3;
-    const double MIN_DISTANCE_TO_FRONTIER = 1.0;
-    const int MIN_FREE_THRESHOLD = 4;
+    double min_frontier_length_m_ = 0.25;
+    double min_distance_to_frontier_m_ = 0.75;
+    double max_distance_to_frontier_m_ = 40.0;
+    double frontier_size_weight_ = 1.0;
+    double frontier_distance_weight_ = 0.35;
+    double frontier_distance_cap_m_ = 20.0;
+    int min_free_threshold_ = 4;
     Costmap2D costmap_;
     rclcpp_action::Client<NavigateToPose>::SharedPtr poseNavigator_;
     Publisher<MarkerArray>::SharedPtr markerArrayPublisher_;
     MarkerArray markersMsg_;
     Subscription<OccupancyGrid>::SharedPtr mapSubscription_;
     bool isExploring_ = false;
+    bool isStopped_ = false;  // true once stop() has been called — prevents result_callback cascade
     int markerId_;
     string mapPath_;
     string mapTopic_;
@@ -150,6 +170,19 @@ private:
         vector<Point> points;
         string getKey() const { return to_string(centroid.x) + "," + to_string(centroid.y); }
     };
+
+    double frontierDistance(const Frontier & frontier, const Point & position) const {
+        return sqrt(pow((double(frontier.centroid.x) - double(position.x)), 2.0) +
+                    pow((double(frontier.centroid.y) - double(position.y)), 2.0));
+    }
+
+    double scoreFrontier(const Frontier & frontier, const Point & position) const {
+        const double distance = frontierDistance(frontier, position);
+        const double frontier_length_m = frontier.points.size() * costmap_.getResolution();
+        const double clamped_distance = std::min(distance, frontier_distance_cap_m_);
+        return frontier_size_weight_ * frontier_length_m +
+               frontier_distance_weight_ * clamped_distance;
+    }
 
     // Called for nav_msgs/Odometry messages (odom_topic).
     void odomCallback(Odometry::UniquePtr msg) {
@@ -252,6 +285,8 @@ private:
     }
 
     void stop() {
+        if (isStopped_) return;  // prevent cascading stop from result_callbacks
+        isStopped_ = true;
         RCLCPP_INFO(get_logger(), "Stopped...");
         odomSubscription_.reset();
         poseSubscription_.reset();
@@ -262,7 +297,7 @@ private:
     }
 
     void explore() {
-        if (isExploring_) { return; }
+        if (isExploring_ || isStopped_) { return; }
         auto frontiers = findFrontiers();
         if (frontiers.empty()) {
             if (!hasNavigated_) {
@@ -275,7 +310,22 @@ private:
             stop();
             return;
         }
-        const auto frontier = frontiers[0];
+        const auto robot_position = pose_->pose.pose.position;
+        const auto frontier_it = std::max_element(
+            frontiers.begin(), frontiers.end(),
+            [this, &robot_position](const Frontier & a, const Frontier & b) {
+                return scoreFrontier(a, robot_position) < scoreFrontier(b, robot_position);
+            });
+        const auto frontier = *frontier_it;
+
+        RCLCPP_INFO(get_logger(),
+            "Selected frontier %.2f, %.2f (size=%.2fm, dist=%.2fm, score=%.2f)",
+            frontier.centroid.x,
+            frontier.centroid.y,
+            frontier.points.size() * costmap_.getResolution(),
+            frontierDistance(frontier, robot_position),
+            scoreFrontier(frontier, robot_position));
+
         drawMarkers(frontiers);
         auto goal = NavigateToPose::Goal();
         goal.pose.pose.position = frontier.centroid;
@@ -284,17 +334,19 @@ private:
 
         RCLCPP_INFO(get_logger(), "Sending goal %f,%f", frontier.centroid.x, frontier.centroid.y);
 
+        // Set exploring flag synchronously BEFORE async_send_goal to prevent
+        // updateFullMap() from calling explore() again before the response arrives.
+        isExploring_ = true;
+
         auto send_goal_options = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
-        // Capture by value: goal_response fires after explore() returns so &frontier
-        // would be a dangling reference.
         send_goal_options.goal_response_callback = [this](
                 const GoalHandleNavigateToPose::SharedPtr &goal_handle) {
             if (goal_handle) {
                 RCLCPP_INFO(get_logger(), "Goal accepted by server, waiting for result");
-                isExploring_ = true;
                 hasNavigated_ = true;
             } else {
                 RCLCPP_ERROR(get_logger(), "Goal was rejected by server");
+                isExploring_ = false;  // allow next explore() attempt
             }
         };
 
@@ -374,6 +426,14 @@ private:
         return out;
     }
 
+    /// A cell is traversable if it is not lethal and not unknown — this includes
+    /// FREE_SPACE (0) and inflated cells (1-252).  Using FREE_SPACE alone misses
+    /// narrow passages where inflation zones from both walls overlap, leaving no
+    /// cost-0 cells even though the robot can physically fit.
+    static bool isTraversable(unsigned char cost) {
+        return cost != NO_INFORMATION && cost != LETHAL_OBSTACLE;
+    }
+
     bool isAchievableFrontierCell(unsigned int idx,
                                   const vector<bool> &frontier_flag) {
         auto map = costmap_.getCharMap();
@@ -382,11 +442,11 @@ private:
             return false;
         }
 
-        //check there's enough free space for robot to move to frontier
+        // check there's enough traversable space for robot to approach frontier
         int freeCount = 0;
         for (unsigned int nbr: nhood8(idx)) {
-            if (map[nbr] == FREE_SPACE) {
-                if (++freeCount >= MIN_FREE_THRESHOLD) {
+            if (isTraversable(map[nbr])) {
+                if (++freeCount >= min_free_threshold_) {
                     return true;
                 }
             }
@@ -465,16 +525,16 @@ private:
 
         unsigned int pos = costmap_.getIndex(mx, my);
 
-        // If the robot's cell is not FREE_SPACE (common with VDB+patchworkpp since the
+        // If the robot's cell is not traversable (common with VDB+patchworkpp since the
         // robot's immediate vicinity has no lidar rays), search outward for the nearest
-        // free cell and seed the BFS from there instead.
-        if (map_[pos] != FREE_SPACE) {
+        // traversable cell and seed the BFS from there instead.
+        if (!isTraversable(map_[pos])) {
             queue<unsigned int> seed_bfs;
             vector<bool> seed_visited(size_x_ * size_y_, false);
             seed_bfs.push(pos);
             seed_visited[pos] = true;
             bool found_free = false;
-            // Search up to 200 cells (~20m at 0.1m/cell) for the nearest free cell.
+            // Search up to 200×200 cells for the nearest traversable cell.
             const unsigned int MAX_SEED_SEARCH = 200 * 200;
             unsigned int seed_iters = 0;
             while (!seed_bfs.empty() && seed_iters < MAX_SEED_SEARCH) {
@@ -484,7 +544,7 @@ private:
                 for (unsigned int nbr : nhood8(idx)) {
                     if (seed_visited[nbr]) continue;
                     seed_visited[nbr] = true;
-                    if (map_[nbr] == FREE_SPACE) {
+                    if (isTraversable(map_[nbr])) {
                         pos = nbr;
                         found_free = true;
                         break;
@@ -497,7 +557,7 @@ private:
             }
             if (!found_free) {
                 RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-                    "Robot vicinity is all unknown — no free cells reachable yet.");
+                    "Robot vicinity is all unknown/lethal — no traversable cells reachable yet.");
                 return frontier_list;
             }
         }
@@ -510,24 +570,22 @@ private:
             bfs.pop();
 
             for (unsigned nbr: nhood8(idx)) {
-                // add to queue all free, unvisited cells, use descending search in case
-                // initialized on non-free cell
-                if (map_[nbr] == FREE_SPACE && !visited_flag[nbr]) {
+                // Expand through all traversable cells (free + inflated).
+                // Using FREE_SPACE alone blocks the BFS at inflation boundaries,
+                // making corridors narrower than 2×inflation_radius unreachable.
+                if (isTraversable(map_[nbr]) && !visited_flag[nbr]) {
                     visited_flag[nbr] = true;
                     bfs.push(nbr);
-                    // check if cell is new frontier cell (unvisited, NO_INFORMATION, free
-                    // neighbour)
                 } else if (isAchievableFrontierCell(nbr, frontier_flag)) {
                     frontier_flag[nbr] = true;
                     const Frontier frontier = buildNewFrontier(nbr, frontier_flag);
 
-                    double distance = sqrt(pow((double(frontier.centroid.x) - double(position.x)), 2.0) +
-                                           pow((double(frontier.centroid.y) - double(position.y)), 2.0));
-                    if (distance < MIN_DISTANCE_TO_FRONTIER) { continue; }
-                    if (frontier.points.size() * costmap_.getResolution() >=
-                        MIN_FRONTIER_DENSITY) {
-                        frontier_list.push_back(frontier);
-                    }
+                    const double distance = frontierDistance(frontier, position);
+                    const double frontier_length_m = frontier.points.size() * costmap_.getResolution();
+                    if (distance < min_distance_to_frontier_m_) { continue; }
+                    if (distance > max_distance_to_frontier_m_) { continue; }
+                    if (frontier_length_m < min_frontier_length_m_) { continue; }
+                    frontier_list.push_back(frontier);
                 }
             }
         }
