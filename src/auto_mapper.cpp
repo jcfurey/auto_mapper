@@ -216,7 +216,7 @@ private:
                 mapTopic_.c_str(), poseTopic_.c_str());
             return;
         }
-        RCLCPP_INFO(get_logger(), "updateFullMap...");
+        RCLCPP_DEBUG(get_logger(), "updateFullMap...");
         const auto occupancyGridInfo = occupancyGrid->info;
         unsigned int size_in_cells_x = occupancyGridInfo.width;
         unsigned int size_in_cells_y = occupancyGridInfo.height;
@@ -224,7 +224,7 @@ private:
         double origin_x = occupancyGridInfo.origin.position.x;
         double origin_y = occupancyGridInfo.origin.position.y;
 
-        RCLCPP_INFO(get_logger(), "received full new map, resizing to: %d, %d", size_in_cells_x,
+        RCLCPP_DEBUG(get_logger(), "received full new map, resizing to: %d, %d", size_in_cells_x,
                     size_in_cells_y);
         costmap_.resizeMap(size_in_cells_x,
                            size_in_cells_y,
@@ -239,7 +239,7 @@ private:
         // fill map with data
         unsigned char *costmap_data = costmap_.getCharMap();
         size_t costmap_size = costmap_.getSizeInCellsX() * costmap_.getSizeInCellsY();
-        RCLCPP_INFO(get_logger(), "full map update, %lu values", costmap_size);
+        RCLCPP_DEBUG(get_logger(), "full map update, %lu values", costmap_size);
         for (size_t i = 0; i < costmap_size && i < occupancyGrid->data.size(); ++i) {
             auto cell_cost = static_cast<unsigned char>(occupancyGrid->data[i]);
             costmap_data[i] = costTranslationTable_[cell_cost];
@@ -250,7 +250,7 @@ private:
 
     void drawMarkers(const vector<Frontier> &frontiers) {
         for (const auto &frontier: frontiers) {
-            RCLCPP_INFO(get_logger(), "visualising %f,%f ", frontier.centroid.x, frontier.centroid.y);
+            RCLCPP_DEBUG(get_logger(), "visualising %f,%f ", frontier.centroid.x, frontier.centroid.y);
             ColorRGBA green;
             green.r = 0;
             green.g = 1.0;
