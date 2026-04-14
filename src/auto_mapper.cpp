@@ -134,6 +134,7 @@ private:
     Subscription<OccupancyGrid>::SharedPtr mapSubscription_;
     bool isExploring_ = false;
     bool isStopped_ = false;  // true once stop() has been called — prevents result_callback cascade
+    steady_clock::time_point next_explore_time_ = steady_clock::now();  // backoff after rejection
     int markerId_;
     string mapPath_;
     string mapTopic_;
@@ -298,6 +299,7 @@ private:
 
     void explore() {
         if (isExploring_ || isStopped_) { return; }
+        if (steady_clock::now() < next_explore_time_) { return; }  // backoff after rejection
         auto frontiers = findFrontiers();
         if (frontiers.empty()) {
             if (!hasNavigated_) {
@@ -345,8 +347,10 @@ private:
                 RCLCPP_INFO(get_logger(), "Goal accepted by server, waiting for result");
                 hasNavigated_ = true;
             } else {
-                RCLCPP_ERROR(get_logger(), "Goal was rejected by server");
-                isExploring_ = false;  // allow next explore() attempt
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                    "Goal rejected by server (not yet active?) — retrying in 5s");
+                isExploring_ = false;
+                next_explore_time_ = steady_clock::now() + 5s;
             }
         };
 
@@ -403,23 +407,18 @@ private:
         unsigned int mx, my;
         vector<unsigned int> out;
         costmap_.indexToCells(idx, mx, my);
-        const int x = mx;
-        const int y = my;
+        const int x = static_cast<int>(mx);
+        const int y = static_cast<int>(my);
+        const int sx = static_cast<int>(costmap_.getSizeInCellsX());
+        const int sy = static_cast<int>(costmap_.getSizeInCellsY());
         const pair<int, int> directions[] = {
-                pair(-1, -1),
-                pair(-1, 1),
-                pair(1, -1),
-                pair(1, 1),
-                pair(1, 0),
-                pair(-1, 0),
-                pair(0, 1),
-                pair(0, -1)
+                {-1, -1}, {-1, 1}, {1, -1}, {1, 1},
+                {1, 0}, {-1, 0}, {0, 1}, {0, -1}
         };
         for (const auto &d: directions) {
             int newX = x + d.first;
             int newY = y + d.second;
-            if (newX > -1 && newX < costmap_.getSizeInCellsX() &&
-                newY > -1 && newY < costmap_.getSizeInCellsY()) {
+            if (newX >= 0 && newX < sx && newY >= 0 && newY < sy) {
                 out.push_back(costmap_.getIndex(newX, newY));
             }
         }

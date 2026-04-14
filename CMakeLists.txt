@@ -21,7 +21,6 @@ set(deps
         rclcpp_action
         nav2_costmap_2d
         nav2_map_server
-        slam_toolbox
         visualization_msgs
         nav2_util
         std_msgs
@@ -31,8 +30,17 @@ set(deps
 set(targets
         auto_mapper)
 
+# Optional map backends — auto_mapper works with any OccupancyGrid source.
+# These are only needed for the bundled launch files, not the node itself.
+set(optional_deps
+        slam_toolbox)
+
 foreach (d ${deps})
   find_package(${d} REQUIRED)
+endforeach ()
+
+foreach (d ${optional_deps})
+  find_package(${d} QUIET)
 endforeach ()
 
 foreach (t ${targets})

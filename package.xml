@@ -3,7 +3,7 @@
 <package format="3">
   <name>auto_mapper</name>
   <version>0.0.0</version>
-  <description>Autonomous mapper using slam toolbox</description>
+  <description>Autonomous frontier-based exploration using any OccupancyGrid map source</description>
   <maintainer email="omar.gamil.salem@gmail.com">omar</maintainer>
   <license>Apache-2.0</license>
 
@@ -20,7 +20,6 @@
   <depend>tf2_ros</depend>
   <depend>nav2_costmap_2d</depend>
   <depend>nav2_map_server</depend>
-  <depend>slam_toolbox</depend>
   <depend>visualization_msgs</depend>
   <depend>nav2_util</depend>
   <depend>std_msgs</depend>
@@ -28,6 +27,9 @@
   <depend>angles</depend>
   <depend>tf2_geometry_msgs</depend>
   <depend>behaviortree_cpp_v3</depend>
+
+  <!-- Optional map backends — only needed if using the bundled launch files -->
+  <!-- <exec_depend>slam_toolbox</exec_depend> -->
 
   <exec_depend>controller_manager</exec_depend>
   <exec_depend>joint_state_broadcaster</exec_depend>
