@@ -9,6 +9,7 @@
 #include <array>
 #include <fstream>
 #include <algorithm>
+#include <limits>
 
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -142,6 +143,16 @@ private:
     bool isStopped_ = false;  // true once stop() has been called — prevents result_callback cascade
     steady_clock::time_point next_explore_time_ = steady_clock::now();  // backoff after rejection
     int markerId_;
+
+    // Blacklist: rejected goal locations are remembered so the same frontier
+    // centroid is not re-selected on the next map update.  Each entry stores
+    // the world-frame position and the time it was blacklisted.  Entries expire
+    // after blacklist_duration_ so that previously inaccessible areas can be
+    // retried once the map has changed significantly.
+    struct BlacklistEntry { double x; double y; steady_clock::time_point when; };
+    vector<BlacklistEntry> blacklist_;
+    static constexpr double blacklist_radius_m_ = 1.0;  // reject frontiers within this radius of a blacklisted goal
+    static constexpr auto blacklist_duration_ = chrono::seconds(60);  // entries expire after this
     string mapPath_;
     string mapTopic_;
     string odomTopic_;
@@ -181,6 +192,25 @@ private:
     double frontierDistance(const Frontier & frontier, const Point & position) const {
         return sqrt(pow((double(frontier.centroid.x) - double(position.x)), 2.0) +
                     pow((double(frontier.centroid.y) - double(position.y)), 2.0));
+    }
+
+    bool isBlacklisted(const Point & p) const {
+        for (const auto & entry : blacklist_) {
+            double dx = p.x - entry.x;
+            double dy = p.y - entry.y;
+            if (dx * dx + dy * dy < blacklist_radius_m_ * blacklist_radius_m_) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void pruneBlacklist() {
+        auto now = steady_clock::now();
+        blacklist_.erase(
+            std::remove_if(blacklist_.begin(), blacklist_.end(),
+                [now](const BlacklistEntry & e) { return (now - e.when) > blacklist_duration_; }),
+            blacklist_.end());
     }
 
     double robotYaw() const {
@@ -281,6 +311,8 @@ private:
 
     /// Shift a goal point toward the lowest-cost cell within a search radius.
     /// In tunnels this pulls centroids away from walls toward the corridor center.
+    /// Strongly prefers FREE_SPACE cells; within a cost tier, picks the cell
+    /// closest to the original centroid.
     Point refineGoalClearance(const Point & centroid) const {
         if (goal_clearance_radius_m_ <= 0.0) return centroid;
 
@@ -294,10 +326,13 @@ private:
         int sx = static_cast<int>(costmap_.getSizeInCellsX());
         int sy = static_cast<int>(costmap_.getSizeInCellsY());
 
-        unsigned char best_cost = costmap_.getCost(cx, cy);
+        // Maximum acceptable cost — reject inscribed-inflated and lethal.
+        // Nav2's INSCRIBED_INFLATED_OBSTACLE is 253; we want strictly below that.
+        static constexpr unsigned char MAX_ACCEPTABLE_COST = 252;
+
+        unsigned char best_cost = 255;  // start worse than anything
         unsigned int best_mx = cx, best_my = cy;
-        // Track distance² to centroid to break ties (prefer closest to original)
-        double best_dist2 = 0.0;
+        double best_dist2 = std::numeric_limits<double>::max();
 
         for (int dy = -radius_cells; dy <= radius_cells; ++dy) {
             for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
@@ -306,6 +341,11 @@ private:
                 if (nx < 0 || nx >= sx || ny < 0 || ny >= sy) continue;
 
                 unsigned char cost = costmap_.getCost(nx, ny);
+                // Skip cells that are too dangerous
+                if (cost > MAX_ACCEPTABLE_COST) continue;
+                // Skip unknown cells — we want goals in observed free space
+                if (cost == NO_INFORMATION) continue;
+
                 double dist2 = dx * dx + dy * dy;
                 if (cost < best_cost ||
                     (cost == best_cost && dist2 < best_dist2)) {
@@ -316,6 +356,10 @@ private:
                 }
             }
         }
+
+        // If no acceptable cell was found, return original centroid
+        // (explore() will catch it in the validation step)
+        if (best_cost > MAX_ACCEPTABLE_COST) return centroid;
 
         Point refined;
         double wx, wy;
@@ -378,12 +422,28 @@ private:
     void explore() {
         if (isExploring_ || isStopped_) { return; }
         if (steady_clock::now() < next_explore_time_) { return; }  // backoff after rejection
+
+        pruneBlacklist();
+
         auto frontiers = findFrontiers();
+
+        // Remove blacklisted frontiers before scoring.
+        frontiers.erase(
+            std::remove_if(frontiers.begin(), frontiers.end(),
+                [this](const Frontier & f) { return isBlacklisted(f.centroid); }),
+            frontiers.end());
+
         if (frontiers.empty()) {
             if (!hasNavigated_) {
                 // Map too sparse to find frontiers yet — wait for more scans.
                 RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
                     "No frontiers found yet — waiting for map to populate...");
+                return;
+            }
+            if (!blacklist_.empty()) {
+                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
+                    "All frontiers blacklisted (%zu entries) — waiting for blacklist expiry or new map data...",
+                    blacklist_.size());
                 return;
             }
             RCLCPP_WARN(get_logger(), "No frontiers remaining — exploration complete.");
@@ -418,9 +478,10 @@ private:
                 auto cost = costmap_.getCost(goal_mx, goal_my);
                 if (cost == LETHAL_OBSTACLE || cost == nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
                     RCLCPP_WARN(get_logger(),
-                        "Goal (%.2f, %.2f) is inside obstacle (cost=%d) — skipping",
+                        "Goal (%.2f, %.2f) is inside obstacle (cost=%d) — blacklisting",
                         goal_point.x, goal_point.y, cost);
-                    next_explore_time_ = steady_clock::now() + 2s;
+                    blacklist_.push_back({goal_point.x, goal_point.y, steady_clock::now()});
+                    next_explore_time_ = steady_clock::now() + 1s;
                     return;
                 }
             }
@@ -460,17 +521,20 @@ private:
                 "Distance remaining: %.2f m", feedback->distance_remaining);
         };
 
-        send_goal_options.result_callback = [this](const GoalHandleNavigateToPose::WrappedResult &result) {
+        // Capture goal position for blacklisting on abort
+        auto goal_x = goal_point.x;
+        auto goal_y = goal_point.y;
+        send_goal_options.result_callback = [this, goal_x, goal_y](const GoalHandleNavigateToPose::WrappedResult &result) {
             isExploring_ = false;
             saveMap();
             clearMarkers();
-            explore();
             switch (result.code) {
                 case rclcpp_action::ResultCode::SUCCEEDED:
                     RCLCPP_INFO(get_logger(), "Goal reached");
                     break;
                 case rclcpp_action::ResultCode::ABORTED:
-                    RCLCPP_ERROR(get_logger(), "Goal was aborted");
+                    RCLCPP_WARN(get_logger(), "Goal (%.2f, %.2f) aborted — blacklisting", goal_x, goal_y);
+                    blacklist_.push_back({goal_x, goal_y, steady_clock::now()});
                     break;
                 case rclcpp_action::ResultCode::CANCELED:
                     RCLCPP_ERROR(get_logger(), "Goal was canceled");
@@ -479,6 +543,7 @@ private:
                     RCLCPP_ERROR(get_logger(), "Unknown result code");
                     break;
             }
+            explore();
         };
         poseNavigator_->async_send_goal(goal, send_goal_options);
     }
