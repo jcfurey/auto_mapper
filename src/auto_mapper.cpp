@@ -70,6 +70,8 @@ public:
         declare_parameter<double>("frontier_distance_weight", 0.35);
         declare_parameter<double>("frontier_distance_cap_m", 20.0);
         declare_parameter<int>("min_free_threshold", 4);
+        declare_parameter<double>("goal_clearance_radius_m", 1.5);
+        declare_parameter<double>("forward_weight", 2.0);
         get_parameter("map_topic",   mapTopic_);
         get_parameter("odom_topic",  odomTopic_);
         get_parameter("pose_topic",  poseTopic_);
@@ -81,6 +83,8 @@ public:
         get_parameter("frontier_distance_weight", frontier_distance_weight_);
         get_parameter("frontier_distance_cap_m", frontier_distance_cap_m_);
         get_parameter("min_free_threshold", min_free_threshold_);
+        get_parameter("goal_clearance_radius_m", goal_clearance_radius_m_);
+        get_parameter("forward_weight", forward_weight_);
 
         // Subscribe to Odometry if odom_topic is non-empty (primary source)
         if (!odomTopic_.empty()) {
@@ -127,6 +131,8 @@ private:
     double frontier_distance_weight_ = 0.35;
     double frontier_distance_cap_m_ = 20.0;
     int min_free_threshold_ = 4;
+    double goal_clearance_radius_m_ = 1.5;
+    double forward_weight_ = 2.0;
     Costmap2D costmap_;
     rclcpp_action::Client<NavigateToPose>::SharedPtr poseNavigator_;
     Publisher<MarkerArray>::SharedPtr markerArrayPublisher_;
@@ -177,12 +183,37 @@ private:
                     pow((double(frontier.centroid.y) - double(position.y)), 2.0));
     }
 
+    double robotYaw() const {
+        if (!pose_) return 0.0;
+        const auto & q = pose_->pose.pose.orientation;
+        return atan2(2.0 * (q.w * q.z + q.x * q.y),
+                     1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    }
+
     double scoreFrontier(const Frontier & frontier, const Point & position) const {
         const double distance = frontierDistance(frontier, position);
         const double frontier_length_m = frontier.points.size() * costmap_.getResolution();
         const double clamped_distance = std::min(distance, frontier_distance_cap_m_);
+
+        // Forward bias: dot product of heading vs. robot→frontier direction.
+        // Produces depth-first behavior in tunnels — continue forward before
+        // turning around to explore side branches.
+        double forward_bonus = 0.0;
+        if (forward_weight_ > 0.0 && distance > 0.5) {
+            double dx = frontier.centroid.x - position.x;
+            double dy = frontier.centroid.y - position.y;
+            double norm = sqrt(dx * dx + dy * dy);
+            double yaw = robotYaw();
+            // dot ∈ [-1, 1]: +1 = directly ahead, -1 = directly behind
+            double dot = (dx * cos(yaw) + dy * sin(yaw)) / norm;
+            // Map to [0, 1] so behind = 0, ahead = 1, side = 0.5
+            double forward_factor = (dot + 1.0) / 2.0;
+            forward_bonus = forward_weight_ * forward_factor * clamped_distance;
+        }
+
         return frontier_size_weight_ * frontier_length_m +
-               frontier_distance_weight_ * clamped_distance;
+               frontier_distance_weight_ * clamped_distance +
+               forward_bonus;
     }
 
     // Called for nav_msgs/Odometry messages (odom_topic).
@@ -246,6 +277,53 @@ private:
         }
 
         explore();
+    }
+
+    /// Shift a goal point toward the lowest-cost cell within a search radius.
+    /// In tunnels this pulls centroids away from walls toward the corridor center.
+    Point refineGoalClearance(const Point & centroid) const {
+        if (goal_clearance_radius_m_ <= 0.0) return centroid;
+
+        unsigned int cx, cy;
+        if (!costmap_.worldToMap(centroid.x, centroid.y, cx, cy)) {
+            return centroid;
+        }
+
+        int radius_cells = static_cast<int>(
+            goal_clearance_radius_m_ / costmap_.getResolution());
+        int sx = static_cast<int>(costmap_.getSizeInCellsX());
+        int sy = static_cast<int>(costmap_.getSizeInCellsY());
+
+        unsigned char best_cost = costmap_.getCost(cx, cy);
+        unsigned int best_mx = cx, best_my = cy;
+        // Track distance² to centroid to break ties (prefer closest to original)
+        double best_dist2 = 0.0;
+
+        for (int dy = -radius_cells; dy <= radius_cells; ++dy) {
+            for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
+                int nx = static_cast<int>(cx) + dx;
+                int ny = static_cast<int>(cy) + dy;
+                if (nx < 0 || nx >= sx || ny < 0 || ny >= sy) continue;
+
+                unsigned char cost = costmap_.getCost(nx, ny);
+                double dist2 = dx * dx + dy * dy;
+                if (cost < best_cost ||
+                    (cost == best_cost && dist2 < best_dist2)) {
+                    best_cost = cost;
+                    best_mx = static_cast<unsigned int>(nx);
+                    best_my = static_cast<unsigned int>(ny);
+                    best_dist2 = dist2;
+                }
+            }
+        }
+
+        Point refined;
+        double wx, wy;
+        costmap_.mapToWorld(best_mx, best_my, wx, wy);
+        refined.x = wx;
+        refined.y = wy;
+        refined.z = 0.0;
+        return refined;
     }
 
     void drawMarkers(const vector<Frontier> &frontiers) {
@@ -328,17 +406,20 @@ private:
             frontierDistance(frontier, robot_position),
             scoreFrontier(frontier, robot_position));
 
-        // Validate that the frontier centroid is in a traversable cell.
-        // The centroid (average of frontier cells) can land inside obstacles,
-        // especially at tunnel entrances where frontiers wrap around corners.
+        // Refine the goal position: search near the centroid for the cell with
+        // the lowest costmap cost.  In tunnels this pulls goals away from walls
+        // toward the corridor center.
+        Point goal_point = refineGoalClearance(frontier.centroid);
+
+        // Validate that the refined goal is in a traversable cell.
         {
             unsigned int goal_mx, goal_my;
-            if (costmap_.worldToMap(frontier.centroid.x, frontier.centroid.y, goal_mx, goal_my)) {
+            if (costmap_.worldToMap(goal_point.x, goal_point.y, goal_mx, goal_my)) {
                 auto cost = costmap_.getCost(goal_mx, goal_my);
                 if (cost == LETHAL_OBSTACLE || cost == nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
                     RCLCPP_WARN(get_logger(),
-                        "Frontier centroid (%.2f, %.2f) is inside obstacle (cost=%d) — skipping",
-                        frontier.centroid.x, frontier.centroid.y, cost);
+                        "Goal (%.2f, %.2f) is inside obstacle (cost=%d) — skipping",
+                        goal_point.x, goal_point.y, cost);
                     next_explore_time_ = steady_clock::now() + 2s;
                     return;
                 }
@@ -347,11 +428,12 @@ private:
 
         drawMarkers(frontiers);
         auto goal = NavigateToPose::Goal();
-        goal.pose.pose.position = frontier.centroid;
+        goal.pose.pose.position = goal_point;
         goal.pose.pose.orientation.w = 1.;
         goal.pose.header.frame_id = "map";
 
-        RCLCPP_INFO(get_logger(), "Sending goal %f,%f", frontier.centroid.x, frontier.centroid.y);
+        RCLCPP_INFO(get_logger(), "Sending goal %.2f,%.2f (centroid was %.2f,%.2f)",
+            goal_point.x, goal_point.y, frontier.centroid.x, frontier.centroid.y);
 
         // Set exploring flag synchronously BEFORE async_send_goal to prevent
         // updateFullMap() from calling explore() again before the response arrives.
