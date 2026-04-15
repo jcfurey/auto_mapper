@@ -73,6 +73,7 @@ public:
         declare_parameter<int>("min_free_threshold", 4);
         declare_parameter<double>("goal_clearance_radius_m", 1.5);
         declare_parameter<double>("forward_weight", 2.0);
+        declare_parameter<double>("startup_delay_sec", 0.0);
         get_parameter("map_topic",   mapTopic_);
         get_parameter("odom_topic",  odomTopic_);
         get_parameter("pose_topic",  poseTopic_);
@@ -86,6 +87,15 @@ public:
         get_parameter("min_free_threshold", min_free_threshold_);
         get_parameter("goal_clearance_radius_m", goal_clearance_radius_m_);
         get_parameter("forward_weight", forward_weight_);
+
+        double startup_delay_sec = 0.0;
+        get_parameter("startup_delay_sec", startup_delay_sec);
+        if (startup_delay_sec > 0.0) {
+            next_explore_time_ = steady_clock::now() +
+                chrono::duration_cast<steady_clock::duration>(
+                    chrono::duration<double>(startup_delay_sec));
+            RCLCPP_INFO(get_logger(), "Startup delay: %.1f seconds before first exploration.", startup_delay_sec);
+        }
 
         // Subscribe to Odometry if odom_topic is non-empty (primary source)
         if (!odomTopic_.empty()) {
@@ -421,7 +431,17 @@ private:
 
     void explore() {
         if (isExploring_ || isStopped_) { return; }
-        if (steady_clock::now() < next_explore_time_) { return; }  // backoff after rejection
+        if (steady_clock::now() < next_explore_time_) {
+            if (!hasNavigated_) {
+                auto remaining = chrono::duration_cast<chrono::seconds>(
+                    next_explore_time_ - steady_clock::now()).count();
+                if (remaining > 0) {
+                    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                        "Exploration starts in %ld seconds...", remaining);
+                }
+            }
+            return;
+        }
 
         pruneBlacklist();
 
