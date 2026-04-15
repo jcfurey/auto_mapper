@@ -328,6 +328,23 @@ private:
             frontierDistance(frontier, robot_position),
             scoreFrontier(frontier, robot_position));
 
+        // Validate that the frontier centroid is in a traversable cell.
+        // The centroid (average of frontier cells) can land inside obstacles,
+        // especially at tunnel entrances where frontiers wrap around corners.
+        {
+            unsigned int goal_mx, goal_my;
+            if (costmap_.worldToMap(frontier.centroid.x, frontier.centroid.y, goal_mx, goal_my)) {
+                auto cost = costmap_.getCost(goal_mx, goal_my);
+                if (cost == LETHAL_OBSTACLE || cost == nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+                    RCLCPP_WARN(get_logger(),
+                        "Frontier centroid (%.2f, %.2f) is inside obstacle (cost=%d) — skipping",
+                        frontier.centroid.x, frontier.centroid.y, cost);
+                    next_explore_time_ = steady_clock::now() + 2s;
+                    return;
+                }
+            }
+        }
+
         drawMarkers(frontiers);
         auto goal = NavigateToPose::Goal();
         goal.pose.pose.position = frontier.centroid;
