@@ -25,6 +25,7 @@
 #include "visualization_msgs/msg/marker_array.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 #include "std_msgs/std_msgs/msg/color_rgba.hpp"
+#include "std_srvs/srv/set_bool.hpp"
 
 
 using std::placeholders::_1;
@@ -121,6 +122,16 @@ public:
                 this,
                 "/navigate_to_pose");
 
+        declare_parameter<bool>("start_enabled", true);
+        get_parameter("start_enabled", enabled_);
+        RCLCPP_INFO(get_logger(), "Exploration %s at startup.",
+            enabled_ ? "enabled" : "disabled");
+
+        setEnabledService_ = create_service<std_srvs::srv::SetBool>(
+            "~/set_enabled",
+            std::bind(&AutoMapper::setEnabledCallback, this,
+                std::placeholders::_1, std::placeholders::_2));
+
         // Wait for the navigate_to_pose action server, but yield to the executor
         // so the node can be interrupted (e.g. Ctrl-C) while waiting.
         while (!poseNavigator_->wait_for_action_server(1s)) {
@@ -147,10 +158,12 @@ private:
     Costmap2D costmap_;
     rclcpp_action::Client<NavigateToPose>::SharedPtr poseNavigator_;
     Publisher<MarkerArray>::SharedPtr markerArrayPublisher_;
+    Service<std_srvs::srv::SetBool>::SharedPtr setEnabledService_;
     MarkerArray markersMsg_;
     Subscription<OccupancyGrid>::SharedPtr mapSubscription_;
     bool isExploring_ = false;
     bool isStopped_ = false;  // true once stop() has been called — prevents result_callback cascade
+    bool enabled_ = true;     // runtime soft-toggle via ~/set_enabled; distinct from isStopped_
     steady_clock::time_point next_explore_time_ = steady_clock::now();  // backoff after rejection
     int markerId_;
 
@@ -429,8 +442,38 @@ private:
         clearMarkers();
     }
 
+    void setEnabledCallback(
+        const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+        std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
+        if (isStopped_) {
+            response->success = false;
+            response->message = "AutoMapper has terminated (exploration complete) — relaunch to restart.";
+            return;
+        }
+        const bool prev = enabled_;
+        enabled_ = request->data;
+        if (enabled_ == prev) {
+            response->success = true;
+            response->message = enabled_ ? "already enabled" : "already disabled";
+            return;
+        }
+        if (!enabled_) {
+            RCLCPP_INFO(get_logger(), "Exploration disabled via service; cancelling any active goal.");
+            poseNavigator_->async_cancel_all_goals();
+            // isExploring_ will be cleared by the CANCELED result_callback.
+            clearMarkers();
+            response->message = "exploration disabled";
+        } else {
+            RCLCPP_INFO(get_logger(), "Exploration enabled via service.");
+            next_explore_time_ = steady_clock::now();
+            response->message = "exploration enabled";
+            // explore() will be triggered by the next OccupancyGrid callback.
+        }
+        response->success = true;
+    }
+
     void explore() {
-        if (isExploring_ || isStopped_) { return; }
+        if (isExploring_ || isStopped_ || !enabled_) { return; }
         if (steady_clock::now() < next_explore_time_) {
             if (!hasNavigated_) {
                 auto remaining = chrono::duration_cast<chrono::seconds>(
