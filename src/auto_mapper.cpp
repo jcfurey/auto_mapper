@@ -71,6 +71,8 @@ public:
         min_free_threshold_          = declare_parameter<int>("min_free_threshold", 4);
         goal_clearance_radius_m_     = declare_parameter<double>("goal_clearance_radius_m", 1.5);
         forward_weight_              = declare_parameter<double>("forward_weight", 2.0);
+        blacklist_radius_m_          = declare_parameter<double>("blacklist_radius_m", 1.0);
+        blacklist_duration_sec_      = declare_parameter<double>("blacklist_duration_sec", 60.0);
 
         const double startup_delay_sec = declare_parameter<double>("startup_delay_sec", 0.0);
         if (startup_delay_sec > 0.0) {
@@ -161,12 +163,12 @@ private:
     // Blacklist: rejected goal locations are remembered so the same frontier
     // centroid is not re-selected on the next map update.  Each entry stores
     // the world-frame position and the time it was blacklisted.  Entries expire
-    // after blacklist_duration_ so that previously inaccessible areas can be
-    // retried once the map has changed significantly.
+    // after blacklist_duration_sec_ so that previously inaccessible areas can
+    // be retried once the map has changed significantly.
     struct BlacklistEntry { double x; double y; steady_clock::time_point when; };
     std::vector<BlacklistEntry> blacklist_;
-    static constexpr double blacklist_radius_m_ = 1.0;  // reject frontiers within this radius of a blacklisted goal
-    static constexpr auto blacklist_duration_ = std::chrono::seconds(60);  // entries expire after this
+    double blacklist_radius_m_;       // ROS param — reject frontiers within this radius of a blacklisted goal
+    double blacklist_duration_sec_;   // ROS param — entries expire after this many seconds
     std::string mapPath_;
     std::string mapTopic_;
     std::string odomTopic_;
@@ -222,10 +224,12 @@ private:
     }
 
     void pruneBlacklist() {
-        auto now = steady_clock::now();
+        const auto now = steady_clock::now();
+        const auto duration = std::chrono::duration_cast<steady_clock::duration>(
+            std::chrono::duration<double>(blacklist_duration_sec_));
         blacklist_.erase(
             std::remove_if(blacklist_.begin(), blacklist_.end(),
-                [now](const BlacklistEntry & e) { return (now - e.when) > blacklist_duration_; }),
+                [now, duration](const BlacklistEntry & e) { return (now - e.when) > duration; }),
             blacklist_.end());
     }
 
@@ -332,6 +336,13 @@ private:
         explore();
     }
 
+    /// Maximum costmap cost we'll accept for a goal cell. Both refinement
+    /// (refineGoalClearance) and validation (in explore()) check against
+    /// this threshold so a borderline cell can't pass one and fail the other.
+    /// Set strictly below INSCRIBED_INFLATED_OBSTACLE (253), so cells in
+    /// [253, 254] are always rejected.
+    static constexpr unsigned char MAX_ACCEPTABLE_COST_ = 252;
+
     /// Shift a goal point toward the lowest-cost cell within a search radius.
     /// In tunnels this pulls centroids away from walls toward the corridor center.
     /// Strongly prefers FREE_SPACE cells; within a cost tier, picks the cell
@@ -349,10 +360,6 @@ private:
         int sx = static_cast<int>(costmap_.getSizeInCellsX());
         int sy = static_cast<int>(costmap_.getSizeInCellsY());
 
-        // Maximum acceptable cost — reject inscribed-inflated and lethal.
-        // Nav2's INSCRIBED_INFLATED_OBSTACLE is 253; we want strictly below that.
-        static constexpr unsigned char MAX_ACCEPTABLE_COST = 252;
-
         unsigned char best_cost = 255;  // start worse than anything
         unsigned int best_mx = cx, best_my = cy;
         double best_dist2 = std::numeric_limits<double>::max();
@@ -365,7 +372,7 @@ private:
 
                 unsigned char cost = costmap_.getCost(nx, ny);
                 // Skip cells that are too dangerous
-                if (cost > MAX_ACCEPTABLE_COST) continue;
+                if (cost > MAX_ACCEPTABLE_COST_) continue;
                 // Skip unknown cells — we want goals in observed free space
                 if (cost == NO_INFORMATION) continue;
 
@@ -382,7 +389,7 @@ private:
 
         // If no acceptable cell was found, return original centroid
         // (explore() will catch it in the validation step)
-        if (best_cost > MAX_ACCEPTABLE_COST) return centroid;
+        if (best_cost > MAX_ACCEPTABLE_COST_) return centroid;
 
         Point refined;
         double wx, wy;
@@ -544,12 +551,15 @@ private:
         // toward the corridor center.
         Point goal_point = refineGoalClearance(frontier.centroid);
 
-        // Validate that the refined goal is in a traversable cell.
+        // Validate that the refined goal is in a traversable cell. Use the same
+        // MAX_ACCEPTABLE_COST_ threshold as refineGoalClearance — if the two
+        // disagree a borderline cell can pass refinement and fail validation
+        // (or vice versa) on the same goal.
         {
             unsigned int goal_mx, goal_my;
             if (costmap_.worldToMap(goal_point.x, goal_point.y, goal_mx, goal_my)) {
                 auto cost = costmap_.getCost(goal_mx, goal_my);
-                if (cost == LETHAL_OBSTACLE || cost == nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+                if (cost > MAX_ACCEPTABLE_COST_) {
                     RCLCPP_WARN(get_logger(),
                         "Goal (%.2f, %.2f) is inside obstacle (cost=%d) — blacklisting",
                         goal_point.x, goal_point.y, cost);
