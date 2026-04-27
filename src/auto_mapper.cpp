@@ -575,7 +575,12 @@ private:
         auto goal = NavigateToPose::Goal();
         goal.pose.pose.position = goal_point;
         goal.pose.pose.orientation.w = 1.;
-        goal.pose.header.frame_id = "map";
+        // Use the costmap's frame_id, not a hardcoded "map" — the marker fix
+        // (commit e0b1ef9) caught this for visualization but missed the actual
+        // goal. If the costmap publishes in any other frame (multi-robot
+        // namespace, renamed frames), a hardcoded "map" silently misroutes.
+        goal.pose.header.frame_id = mapFrameId_;
+        goal.pose.header.stamp = now();
 
         RCLCPP_INFO(get_logger(), "Sending goal %.2f,%.2f (centroid was %.2f,%.2f)",
             goal_point.x, goal_point.y, frontier.centroid.x, frontier.centroid.y);
