@@ -121,6 +121,12 @@ public:
         poseNavigator_ = rclcpp_action::create_client<NavigateToPose>(
                 this,
                 "/navigate_to_pose");
+        // Create the map_saver client once and reuse. The previous code
+        // allocated a fresh client (and blocked the executor for up to 1 s in
+        // wait_for_service) on every result_callback — i.e. every Nav2 goal
+        // completion. Clients destroyed mid-flight also silently drop their
+        // responses.
+        mapSaverClient_ = create_client<nav2_msgs::srv::SaveMap>("/map_server/save_map");
 
         declare_parameter<bool>("start_enabled", true);
         get_parameter("start_enabled", enabled_);
@@ -159,6 +165,8 @@ private:
     rclcpp_action::Client<NavigateToPose>::SharedPtr poseNavigator_;
     Publisher<MarkerArray>::SharedPtr markerArrayPublisher_;
     Service<std_srvs::srv::SetBool>::SharedPtr setEnabledService_;
+    Client<nav2_msgs::srv::SaveMap>::SharedPtr mapSaverClient_;
+    bool mapSaverAvailable_ = false;  // latched true after first successful service discovery
     MarkerArray markersMsg_;
     Subscription<OccupancyGrid>::SharedPtr mapSubscription_;
     bool isExploring_ = false;
@@ -630,11 +638,18 @@ private:
     }
 
     void saveMap() {
-        auto map_saver_cli = create_client<nav2_msgs::srv::SaveMap>("/map_server/save_map");
-
-        if (!map_saver_cli->wait_for_service(1s)) {
-            RCLCPP_INFO(get_logger(), "map_saver service not available — skipping map save.");
-            return;
+        // Non-blocking availability check. service_is_ready() is a polled view
+        // of the discovered server; once it goes true we latch it so we never
+        // pay the discovery cost again. We never call wait_for_service here:
+        // this runs from the result_callback on the single-threaded executor,
+        // and a 1 s block would queue up subsequent goal-completion callbacks.
+        if (!mapSaverAvailable_) {
+            if (!mapSaverClient_->service_is_ready()) {
+                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
+                    "map_saver service not yet available — skipping map save.");
+                return;
+            }
+            mapSaverAvailable_ = true;
         }
         RCLCPP_INFO(get_logger(), "Saving map to %s ...", mapPath_.c_str());
 
@@ -644,7 +659,7 @@ private:
         request->image_format = "pgm";
         request->map_mode = "trinary";
 
-        map_saver_cli->async_send_request(request);
+        mapSaverClient_->async_send_request(request);
         RCLCPP_INFO(get_logger(), "Save map request sent for map at %s", mapPath_.c_str());
     }
 
