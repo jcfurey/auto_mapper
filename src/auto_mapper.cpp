@@ -293,12 +293,18 @@ private:
 
     void updateFullMap(OccupancyGrid::UniquePtr occupancyGrid) {
         if (pose_ == nullptr) {
+            // Whichever pose source is configured (may be both); print the
+            // non-empty one so operators can see what we're actually waiting
+            // on. Falling back to "<unset>" makes the misconfiguration loud.
+            const std::string pose_source = !odomTopic_.empty() ? odomTopic_
+                                          : !poseTopic_.empty() ? poseTopic_
+                                          : std::string("<unset>");
             RCLCPP_WARN_THROTTLE(
                 get_logger(),
                 *get_clock(),
                 5000, // Throttle to every 5 seconds
                 "Map received on topic '%s', but waiting for initial pose on topic '%s' to begin exploring.",
-                mapTopic_.c_str(), poseTopic_.c_str());
+                mapTopic_.c_str(), pose_source.c_str());
             return;
         }
         RCLCPP_DEBUG(get_logger(), "updateFullMap...");
