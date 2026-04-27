@@ -179,6 +179,7 @@ private:
     PoseWithCovarianceStamped::UniquePtr pose_;
     bool hasNavigated_ = false;  // true once at least one goal has been accepted
     std::string mapFrameId_ = "map";  // frame_id of the most recent OccupancyGrid; used for marker headers
+    bool poseFrameMismatchWarned_ = false;  // one-shot guard for the pose/costmap frame WARN
 
     std::array<unsigned char, 256> costTranslationTable_ = initTranslationTable();
 
@@ -311,6 +312,23 @@ private:
         }
         RCLCPP_DEBUG(get_logger(), "updateFullMap...");
         mapFrameId_ = occupancyGrid->header.frame_id;
+
+        // We use pose_->pose.pose.position directly against the costmap (no TF
+        // transform), which assumes pose and costmap are in the same frame.
+        // Warn loudly the first time they disagree — typically when an
+        // operator turns on map-frame localization without realising
+        // auto_mapper isn't TF-aware.
+        if (!poseFrameMismatchWarned_ &&
+            !pose_->header.frame_id.empty() &&
+            pose_->header.frame_id != mapFrameId_) {
+            RCLCPP_WARN(get_logger(),
+                "Pose frame '%s' differs from costmap frame '%s' — auto_mapper "
+                "does not TF-transform pose into the map frame. Frontier search "
+                "and goal coordinates will be wrong unless the two frames are "
+                "related by an identity transform.",
+                pose_->header.frame_id.c_str(), mapFrameId_.c_str());
+            poseFrameMismatchWarned_ = true;
+        }
         const auto occupancyGridInfo = occupancyGrid->info;
         unsigned int size_in_cells_x = occupancyGridInfo.width;
         unsigned int size_in_cells_y = occupancyGridInfo.height;
