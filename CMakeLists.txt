@@ -1,57 +1,40 @@
 cmake_minimum_required(VERSION 3.8)
 project(auto_mapper)
 
-if (CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic)
-endif ()
-
-
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if (CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(
+    -Wall -Wextra -Wpedantic
+    -Wshadow -Wunused-variable -Wunused-function
+    -Wno-ignored-qualifiers
+  )
+endif ()
 
 find_package(ament_cmake REQUIRED)
 
+# Only the deps actually included by src/auto_mapper.cpp.
 set(deps
         rclcpp
-        sensor_msgs
+        rclcpp_action
         geometry_msgs
         nav_msgs
         nav2_msgs
-        tf2
-        tf2_ros
-        rclcpp_action
         nav2_costmap_2d
-        nav2_map_server
-        visualization_msgs
-        nav2_util
         std_msgs
         std_srvs
-        angles
-        tf2_geometry_msgs
-        map_msgs)
-set(targets
-        auto_mapper)
-
-# Optional map backends — auto_mapper works with any OccupancyGrid source.
-# These are only needed for the bundled launch files, not the node itself.
-set(optional_deps
-        slam_toolbox)
+        visualization_msgs)
 
 foreach (d ${deps})
   find_package(${d} REQUIRED)
 endforeach ()
 
-foreach (d ${optional_deps})
-  find_package(${d} QUIET)
-endforeach ()
-
-foreach (t ${targets})
-  add_executable(${t} src/${t}.cpp)
-  ament_target_dependencies(${t} ${deps})
-endforeach ()
-
+add_executable(auto_mapper src/auto_mapper.cpp)
+ament_target_dependencies(auto_mapper ${deps})
 
 install(TARGETS
-        ${targets}
+        auto_mapper
         DESTINATION lib/${PROJECT_NAME})
 
 install(
