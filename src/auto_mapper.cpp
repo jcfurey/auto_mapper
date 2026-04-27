@@ -185,13 +185,20 @@ private:
     static std::array<unsigned char, 256> initTranslationTable() {
         std::array<unsigned char, 256> cost_translation_table{};
 
-        // lineary mapped from [0..100] to [0..255]
-        for (size_t i = 0; i < 256; ++i) {
+        // OccupancyGrid values are int8 in [-1, 100]. After
+        // static_cast<unsigned char> in updateFullMap, valid inputs are
+        // [0..100] and 255 (=-1, NO_INFORMATION). Indices 101..254 are
+        // unreachable but cheap to fill.
+        // Linear map [1..98] → [1..253]. The previous loop started at i=0
+        // and computed (251 * (i - 1)) / 97 with size_t i, which underflowed
+        // (i-1 = SIZE_MAX) and produced a garbage value at index 0 — harmless
+        // because we overwrite it below, but easy to misread.
+        for (size_t i = 1; i < 256; ++i) {
             cost_translation_table[i] =
                     static_cast<unsigned char>(1 + (251 * (i - 1)) / 97);
         }
 
-        // special values:
+        // Special values pinned by the OccupancyGrid → costmap convention.
         cost_translation_table[0] = FREE_SPACE;
         cost_translation_table[99] = 253;
         cost_translation_table[100] = LETHAL_OBSTACLE;
@@ -203,7 +210,6 @@ private:
     struct Frontier {
         Point centroid;
         std::vector<Point> points;
-        std::string getKey() const { return std::to_string(centroid.x) + "," + std::to_string(centroid.y); }
     };
 
     double frontierDistance(const Frontier & frontier, const Point & position) const {
