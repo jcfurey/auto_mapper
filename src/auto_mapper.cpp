@@ -181,6 +181,14 @@ private:
     std::string mapFrameId_ = "map";  // frame_id of the most recent OccupancyGrid; used for marker headers
     bool poseFrameMismatchWarned_ = false;  // one-shot guard for the pose/costmap frame WARN
 
+    // Maximum costmap cost we'll accept for a goal cell. Both refinement
+    // (refineGoalClearance) and validation (in explore()) check against
+    // this threshold so a borderline cell can't pass one and fail the other.
+    // Set strictly below INSCRIBED_INFLATED_OBSTACLE (253), so cells in
+    // [253, 254] are always rejected. NO_INFORMATION (255) is also above
+    // this threshold, so the > comparison rejects unknown cells too.
+    static constexpr unsigned char MAX_ACCEPTABLE_COST_ = 252;
+
     std::array<unsigned char, 256> costTranslationTable_ = initTranslationTable();
 
     static std::array<unsigned char, 256> initTranslationTable() {
@@ -364,13 +372,6 @@ private:
         explore();
     }
 
-    /// Maximum costmap cost we'll accept for a goal cell. Both refinement
-    /// (refineGoalClearance) and validation (in explore()) check against
-    /// this threshold so a borderline cell can't pass one and fail the other.
-    /// Set strictly below INSCRIBED_INFLATED_OBSTACLE (253), so cells in
-    /// [253, 254] are always rejected.
-    static constexpr unsigned char MAX_ACCEPTABLE_COST_ = 252;
-
     /// Shift a goal point toward the lowest-cost cell within a search radius.
     /// In tunnels this pulls centroids away from walls toward the corridor center.
     /// Strongly prefers FREE_SPACE cells; within a cost tier, picks the cell
@@ -399,10 +400,10 @@ private:
                 if (nx < 0 || nx >= sx || ny < 0 || ny >= sy) continue;
 
                 unsigned char cost = costmap_.getCost(nx, ny);
-                // Skip cells that are too dangerous
+                // Skip cells that are too dangerous. NO_INFORMATION (255) is
+                // also above MAX_ACCEPTABLE_COST_ (252), so unknown cells are
+                // rejected here too — no separate check needed.
                 if (cost > MAX_ACCEPTABLE_COST_) continue;
-                // Skip unknown cells — we want goals in observed free space
-                if (cost == NO_INFORMATION) continue;
 
                 double dist2 = dx * dx + dy * dy;
                 if (cost < best_cost ||
@@ -765,9 +766,9 @@ private:
     }
 
     Frontier buildNewFrontier(unsigned int neighborCell, std::vector<bool> &frontier_flag) {
+        // Frontier::centroid is geometry_msgs::msg::Point, default-constructed
+        // to (0, 0, 0) by the rosidl-generated ctor. No explicit zero needed.
         Frontier output;
-        output.centroid.x = 0;
-        output.centroid.y = 0;
 
         std::queue<unsigned int> bfs;
         bfs.push(neighborCell);
