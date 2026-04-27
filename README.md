@@ -1,76 +1,74 @@
-# Modifications
-NAV2 was removed from the launch file, but assumes it is launched elsewhere. Removing NAV2 allows us to start/stop fronteier exploration, but keep NAV2 running.
+# auto_mapper
 
-slamtoolbox was also removed. However automapper expects an occupancy grid.
+Frontier-based autonomous exploration node. Subscribes to a 2D
+`OccupancyGrid` and a robot pose, finds reachable frontiers between
+known-free and unknown space, and dispatches the highest-scoring
+frontier as a Nav2 `NavigateToPose` goal.
 
-## New features
-Subscriptions:
+This is a fork of [Omar-Salem/auto_mapper](https://github.com/Omar-Salem/auto_mapper)
+with substantial divergence — see **Differences from upstream** below.
 
-map_topic `default_value='/projected_map'`
+## Topics
 
-pose_topic `default_value='/dlio/odom_node/pose'`
+| Direction | Topic | Type | Notes |
+| --- | --- | --- | --- |
+| Sub | `<map_topic>` | `nav_msgs/OccupancyGrid` | The map to find frontiers in. Default `/map`. |
+| Sub | `<odom_topic>` | `nav_msgs/Odometry` | Robot pose source. Default `/localization/odometry/odom`. |
+| Sub | `<pose_topic>` | `geometry_msgs/PoseStamped` | Optional alternative to `odom_topic`. Default empty (disabled). |
+| Pub | `/frontiers` | `visualization_msgs/MarkerArray` | Frontier centroids for RViz/Trillium. |
+| Action client | `/navigate_to_pose` | `nav2_msgs/NavigateToPose` | Goal dispatch. Remap as needed. |
+| Service client | `/map_server/save_map` | `nav2_msgs/SaveMap` | Map snapshot on every goal completion + on frontier exhaustion. |
 
-Note pose_topic is of the type `PoseStamped` and gets converted to `PoseStampedCovariance`
+## Services
 
-Save map is now accomplished by `nav2_map_server`
+| Service | Type | Behavior |
+| --- | --- | --- |
+| `~/set_enabled` | `std_srvs/SetBool` | `true` resumes exploration, `false` cancels the active goal and pauses. The node never auto-shuts-down on frontier exhaustion — toggle via this service. |
 
+## Parameters
 
-# Original ReadMe below
+| Param | Default | Notes |
+| --- | --- | --- |
+| `map_topic` | `/map` | OccupancyGrid input. |
+| `odom_topic` | `/localization/odometry/odom` | Primary pose source (Odometry). |
+| `pose_topic` | `""` | Alternative pose source (PoseStamped). |
+| `map_path` | `/tmp/maps` | Where `nav2_map_saver` writes the snapshot. |
+| `start_enabled` | `true` | If false, sit idle until `~/set_enabled` is called. |
+| `startup_delay_sec` | `0.0` | Wait this many seconds before first goal so localization/mapping can warm up. |
+| `min_frontier_length_m` | `0.25` | Reject frontiers shorter than this (filters single-cell holes). |
+| `min_distance_to_frontier_m` | `0.75` | Skip frontiers closer than this. |
+| `max_distance_to_frontier_m` | `40.0` | Skip frontiers farther than this. |
+| `frontier_size_weight` | `1.0` | Score multiplier for frontier length. |
+| `frontier_distance_weight` | `0.35` | Score multiplier for clamped distance (further = more attractive, up to cap). |
+| `frontier_distance_cap_m` | `20.0` | Distance is clamped to this before scoring. |
+| `forward_weight` | `2.0` | Bonus for frontiers in the robot's heading direction (depth-first in tunnels). 0 disables. |
+| `min_free_threshold` | `4` | Number of traversable 8-neighbors required for a cell to count as a frontier. |
+| `goal_clearance_radius_m` | `1.5` | Search this radius around the centroid for the lowest-cost cell to use as the goal. 0 disables. |
+| `blacklist_radius_m` | `1.0` | Re-reject frontiers whose centroid is within this radius of a recently rejected goal. |
+| `blacklist_duration_sec` | `60.0` | Blacklist entries expire after this many seconds. |
 
-<h3 align="center">auto_mapper</h3>
+## Differences from upstream
 
-  <p align="center">
-    Package for auto exploring frontiers and generating a map with ROS 2 Humble / Iron
-  </p>
+- Pose source can be `Odometry` (preferred) or `PoseStamped`; upstream
+  was PoseStamped only.
+- Bundled `nav2`/`slam_toolbox` launch glue removed — this package
+  ships only the node, and is launched from a parent workspace.
+- Frontier scoring is parameterized (size, distance, forward-bias)
+  instead of nearest-frontier.
+- Goal-clearance refinement: shifts the dispatched goal to the lowest
+  cost cell within a radius of the centroid (pulls goals away from
+  walls).
+- BFS expands through inflated cells, not only `FREE_SPACE`, so
+  corridors narrower than 2× inflation_radius are reachable.
+- Seed-cell BFS recovery for cases where the robot's vicinity is
+  entirely unknown/lethal (common with VDB + ground-segmentation).
+- Per-goal blacklist (radius + expiry) prevents repeatedly retrying
+  inaccessible frontiers.
+- `~/set_enabled` runtime soft-toggle.
+- Re-arms automatically after frontier exhaustion (no `stop()`
+  latching).
 
-<video src="https://github.com/Omar-Salem/auto_mapper/blob/master/Demo.mp4" width="320" height="240" controls></video>
+## Acknowledgements
 
-### Prerequisites
-
-* [ROS 2 Humble / Iron](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debians.html) on your Ubuntu 22.04
-* [slam_toolbox](https://github.com/SteveMacenski/slam_toolbox)
-* [nav2](https://github.com/ros-planning/navigation2)
-* [rviz2](https://github.com/ros2/rviz)
-
-### Installation & usage
-
-1. Clone the repo
-```sh
-git clone https://github.com/Omar-Salem/auto_mapper
-```
-2. Build the ROS 2  workspace
-```sh
-cd {workspace_dir}
-```
-```sh
-colcon build --packages-select auto_mapper
-```
-3. Source the ROS Workspace
-```sh
-. install/setup.bash
-```
-
-4. Launch the mapper
-```sh
-ros2 launch auto_mapper auto_mapper.launch.py map_path:=~/map
-```
-
-5. Launch turtlebot3
-```sh
-export TURTLEBOT3_MODEL=burger
-ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py
-```
-
-
-### Gotchas
-* If you receive `Failed to write file: Exception output stream error`, change the map file path to a dir where write access is granted.
-* To use with a custom robot, or if the Twist messages aren't published to `/cmd_vel`, uncomment `SetRemap(src='/cmd_vel', dst='{/your/custom_cmd_vel}}')` in `auto_mapper.launch.py`
-
-### Contact
-
-Omar Salem - [LinkedIn](https://www.linkedin.com/in/omar-salem-4564a590/)
-
-
-
-### Acknowledgements
-* [m-explore](https://github.com/hrnr/m-explore)
+- Original [auto_mapper](https://github.com/Omar-Salem/auto_mapper) by Omar Salem.
+- Frontier BFS pattern from [m-explore](https://github.com/hrnr/m-explore).
