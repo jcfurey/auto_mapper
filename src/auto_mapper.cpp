@@ -55,37 +55,24 @@ public:
             : rclcpp::Node("auto_mapper") {
         RCLCPP_INFO(get_logger(), "AutoMapper started...");
 
-        // Declare and get parameters
-        declare_parameter<std::string>("map_topic",   "/map");
-        declare_parameter<std::string>("odom_topic",  "/localization/odometry/odom");
-        declare_parameter<std::string>("pose_topic",  "");   // optional PoseStamped alternative
-        declare_parameter<std::string>("map_path",    "/tmp/maps");
-        declare_parameter<double>("min_frontier_length_m", 0.25);
-        declare_parameter<double>("min_distance_to_frontier_m", 0.75);
-        declare_parameter<double>("max_distance_to_frontier_m", 40.0);
-        declare_parameter<double>("frontier_size_weight", 1.0);
-        declare_parameter<double>("frontier_distance_weight", 0.35);
-        declare_parameter<double>("frontier_distance_cap_m", 20.0);
-        declare_parameter<int>("min_free_threshold", 4);
-        declare_parameter<double>("goal_clearance_radius_m", 1.5);
-        declare_parameter<double>("forward_weight", 2.0);
-        declare_parameter<double>("startup_delay_sec", 0.0);
-        get_parameter("map_topic",   mapTopic_);
-        get_parameter("odom_topic",  odomTopic_);
-        get_parameter("pose_topic",  poseTopic_);
-        get_parameter("map_path",    mapPath_);
-        get_parameter("min_frontier_length_m", min_frontier_length_m_);
-        get_parameter("min_distance_to_frontier_m", min_distance_to_frontier_m_);
-        get_parameter("max_distance_to_frontier_m", max_distance_to_frontier_m_);
-        get_parameter("frontier_size_weight", frontier_size_weight_);
-        get_parameter("frontier_distance_weight", frontier_distance_weight_);
-        get_parameter("frontier_distance_cap_m", frontier_distance_cap_m_);
-        get_parameter("min_free_threshold", min_free_threshold_);
-        get_parameter("goal_clearance_radius_m", goal_clearance_radius_m_);
-        get_parameter("forward_weight", forward_weight_);
+        // Declare and read parameters in one pass — declare_parameter<T>(name, default)
+        // returns the resolved value, so we don't need a separate get_parameter call
+        // (and we don't need redundant field initializers either).
+        mapTopic_                    = declare_parameter<std::string>("map_topic",   "/map");
+        odomTopic_                   = declare_parameter<std::string>("odom_topic",  "/localization/odometry/odom");
+        poseTopic_                   = declare_parameter<std::string>("pose_topic",  "");   // optional PoseStamped alternative
+        mapPath_                     = declare_parameter<std::string>("map_path",    "/tmp/maps");
+        min_frontier_length_m_       = declare_parameter<double>("min_frontier_length_m", 0.25);
+        min_distance_to_frontier_m_  = declare_parameter<double>("min_distance_to_frontier_m", 0.75);
+        max_distance_to_frontier_m_  = declare_parameter<double>("max_distance_to_frontier_m", 40.0);
+        frontier_size_weight_        = declare_parameter<double>("frontier_size_weight", 1.0);
+        frontier_distance_weight_    = declare_parameter<double>("frontier_distance_weight", 0.35);
+        frontier_distance_cap_m_     = declare_parameter<double>("frontier_distance_cap_m", 20.0);
+        min_free_threshold_          = declare_parameter<int>("min_free_threshold", 4);
+        goal_clearance_radius_m_     = declare_parameter<double>("goal_clearance_radius_m", 1.5);
+        forward_weight_              = declare_parameter<double>("forward_weight", 2.0);
 
-        double startup_delay_sec = 0.0;
-        get_parameter("startup_delay_sec", startup_delay_sec);
+        const double startup_delay_sec = declare_parameter<double>("startup_delay_sec", 0.0);
         if (startup_delay_sec > 0.0) {
             next_explore_time_ = steady_clock::now() +
                 std::chrono::duration_cast<steady_clock::duration>(
@@ -123,8 +110,7 @@ public:
         // responses.
         mapSaverClient_ = create_client<nav2_msgs::srv::SaveMap>("/map_server/save_map");
 
-        declare_parameter<bool>("start_enabled", true);
-        get_parameter("start_enabled", enabled_);
+        enabled_ = declare_parameter<bool>("start_enabled", true);
         RCLCPP_INFO(get_logger(), "Exploration %s at startup.",
             enabled_ ? "enabled" : "disabled");
 
@@ -147,15 +133,17 @@ public:
     }
 
 private:
-    double min_frontier_length_m_ = 0.25;
-    double min_distance_to_frontier_m_ = 0.75;
-    double max_distance_to_frontier_m_ = 40.0;
-    double frontier_size_weight_ = 1.0;
-    double frontier_distance_weight_ = 0.35;
-    double frontier_distance_cap_m_ = 20.0;
-    int min_free_threshold_ = 4;
-    double goal_clearance_radius_m_ = 1.5;
-    double forward_weight_ = 2.0;
+    // Tunables — actual default values live at the declare_parameter<>() call
+    // site in the constructor; these fields are written there before any use.
+    double min_frontier_length_m_;
+    double min_distance_to_frontier_m_;
+    double max_distance_to_frontier_m_;
+    double frontier_size_weight_;
+    double frontier_distance_weight_;
+    double frontier_distance_cap_m_;
+    int    min_free_threshold_;
+    double goal_clearance_radius_m_;
+    double forward_weight_;
     Costmap2D costmap_;
     rclcpp_action::Client<NavigateToPose>::SharedPtr poseNavigator_;
     rclcpp::Publisher<MarkerArray>::SharedPtr markerArrayPublisher_;
