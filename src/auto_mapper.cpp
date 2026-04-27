@@ -3,13 +3,16 @@
 //
 
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <memory>
+#include <queue>
 #include <string>
 #include <array>
-#include <fstream>
 #include <algorithm>
 #include <limits>
+#include <utility>
+#include <vector>
 
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -24,9 +27,8 @@
 #include "nav2_costmap_2d/cost_values.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
 #include "visualization_msgs/msg/marker.hpp"
-#include "std_msgs/std_msgs/msg/color_rgba.hpp"
+#include "std_msgs/msg/color_rgba.hpp"
 #include "std_srvs/srv/set_bool.hpp"
-
 
 using std::placeholders::_1;
 using geometry_msgs::msg::PoseWithCovarianceStamped;
@@ -42,29 +44,22 @@ using nav2_costmap_2d::Costmap2D;
 using nav2_costmap_2d::LETHAL_OBSTACLE;
 using nav2_costmap_2d::NO_INFORMATION;
 using nav2_costmap_2d::FREE_SPACE;
-using std::to_string;
-using std::abs;
-using std::chrono::milliseconds;
-using namespace std::chrono_literals;
-using namespace std;
-using namespace rclcpp;
-using namespace rclcpp_action;
 using std::chrono::steady_clock;
+using namespace std::chrono_literals;
 
-using NavigateToPose = nav2_msgs::action::NavigateToPose;
 using GoalHandleNavigateToPose = rclcpp_action::ClientGoalHandle<NavigateToPose>;
 
-class AutoMapper : public Node {
+class AutoMapper : public rclcpp::Node {
 public:
     AutoMapper()
-            : Node("auto_mapper") {
+            : rclcpp::Node("auto_mapper") {
         RCLCPP_INFO(get_logger(), "AutoMapper started...");
 
         // Declare and get parameters
-        declare_parameter<string>("map_topic",   "/map");
-        declare_parameter<string>("odom_topic",  "/localization/odometry/odom");
-        declare_parameter<string>("pose_topic",  "");   // optional PoseStamped alternative
-        declare_parameter<string>("map_path",    "/tmp/maps");
+        declare_parameter<std::string>("map_topic",   "/map");
+        declare_parameter<std::string>("odom_topic",  "/localization/odometry/odom");
+        declare_parameter<std::string>("pose_topic",  "");   // optional PoseStamped alternative
+        declare_parameter<std::string>("map_path",    "/tmp/maps");
         declare_parameter<double>("min_frontier_length_m", 0.25);
         declare_parameter<double>("min_distance_to_frontier_m", 0.75);
         declare_parameter<double>("max_distance_to_frontier_m", 40.0);
@@ -93,21 +88,21 @@ public:
         get_parameter("startup_delay_sec", startup_delay_sec);
         if (startup_delay_sec > 0.0) {
             next_explore_time_ = steady_clock::now() +
-                chrono::duration_cast<steady_clock::duration>(
-                    chrono::duration<double>(startup_delay_sec));
+                std::chrono::duration_cast<steady_clock::duration>(
+                    std::chrono::duration<double>(startup_delay_sec));
             RCLCPP_INFO(get_logger(), "Startup delay: %.1f seconds before first exploration.", startup_delay_sec);
         }
 
         // Subscribe to Odometry if odom_topic is non-empty (primary source)
         if (!odomTopic_.empty()) {
             odomSubscription_ = create_subscription<Odometry>(
-                    odomTopic_, 10, bind(&AutoMapper::odomCallback, this, _1));
+                    odomTopic_, 10, std::bind(&AutoMapper::odomCallback, this, _1));
             RCLCPP_INFO(get_logger(), "Subscribing to Odometry on '%s'.", odomTopic_.c_str());
         }
         // Subscribe to PoseStamped if pose_topic is non-empty (alternative source)
         if (!poseTopic_.empty()) {
             poseSubscription_ = create_subscription<PoseStamped>(
-                    poseTopic_, 10, bind(&AutoMapper::poseCallback, this, _1));
+                    poseTopic_, 10, std::bind(&AutoMapper::poseCallback, this, _1));
             RCLCPP_INFO(get_logger(), "Subscribing to PoseStamped on '%s'.", poseTopic_.c_str());
         }
         if (odomTopic_.empty() && poseTopic_.empty()) {
@@ -115,7 +110,7 @@ public:
         }
 
         mapSubscription_ = create_subscription<OccupancyGrid>(
-                mapTopic_, 10, bind(&AutoMapper::updateFullMap, this, _1));
+                mapTopic_, 10, std::bind(&AutoMapper::updateFullMap, this, _1));
 
         markerArrayPublisher_ = create_publisher<MarkerArray>("/frontiers", 10);
         poseNavigator_ = rclcpp_action::create_client<NavigateToPose>(
@@ -163,12 +158,12 @@ private:
     double forward_weight_ = 2.0;
     Costmap2D costmap_;
     rclcpp_action::Client<NavigateToPose>::SharedPtr poseNavigator_;
-    Publisher<MarkerArray>::SharedPtr markerArrayPublisher_;
-    Service<std_srvs::srv::SetBool>::SharedPtr setEnabledService_;
-    Client<nav2_msgs::srv::SaveMap>::SharedPtr mapSaverClient_;
+    rclcpp::Publisher<MarkerArray>::SharedPtr markerArrayPublisher_;
+    rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr setEnabledService_;
+    rclcpp::Client<nav2_msgs::srv::SaveMap>::SharedPtr mapSaverClient_;
     bool mapSaverAvailable_ = false;  // latched true after first successful service discovery
     MarkerArray markersMsg_;
-    Subscription<OccupancyGrid>::SharedPtr mapSubscription_;
+    rclcpp::Subscription<OccupancyGrid>::SharedPtr mapSubscription_;
     bool isExploring_ = false;
     bool isStopped_ = false;  // true once stop() has been called — prevents result_callback cascade
     bool enabled_ = true;     // runtime soft-toggle via ~/set_enabled; distinct from isStopped_
@@ -181,24 +176,24 @@ private:
     // after blacklist_duration_ so that previously inaccessible areas can be
     // retried once the map has changed significantly.
     struct BlacklistEntry { double x; double y; steady_clock::time_point when; };
-    vector<BlacklistEntry> blacklist_;
+    std::vector<BlacklistEntry> blacklist_;
     static constexpr double blacklist_radius_m_ = 1.0;  // reject frontiers within this radius of a blacklisted goal
-    static constexpr auto blacklist_duration_ = chrono::seconds(60);  // entries expire after this
-    string mapPath_;
-    string mapTopic_;
-    string odomTopic_;
-    string poseTopic_;
+    static constexpr auto blacklist_duration_ = std::chrono::seconds(60);  // entries expire after this
+    std::string mapPath_;
+    std::string mapTopic_;
+    std::string odomTopic_;
+    std::string poseTopic_;
 
-    Subscription<Odometry>::SharedPtr   odomSubscription_;   // nav_msgs/Odometry (odom_topic)
-    Subscription<PoseStamped>::SharedPtr poseSubscription_;  // geometry_msgs/PoseStamped (pose_topic)
+    rclcpp::Subscription<Odometry>::SharedPtr   odomSubscription_;   // nav_msgs/Odometry (odom_topic)
+    rclcpp::Subscription<PoseStamped>::SharedPtr poseSubscription_;  // geometry_msgs/PoseStamped (pose_topic)
     PoseWithCovarianceStamped::UniquePtr pose_;
     bool hasNavigated_ = false;  // true once at least one goal has been accepted
-    string mapFrameId_ = "map";  // frame_id of the most recent OccupancyGrid; used for marker headers
+    std::string mapFrameId_ = "map";  // frame_id of the most recent OccupancyGrid; used for marker headers
 
-    array<unsigned char, 256> costTranslationTable_ = initTranslationTable();
+    std::array<unsigned char, 256> costTranslationTable_ = initTranslationTable();
 
-    static array<unsigned char, 256> initTranslationTable() {
-        array<unsigned char, 256> cost_translation_table{};
+    static std::array<unsigned char, 256> initTranslationTable() {
+        std::array<unsigned char, 256> cost_translation_table{};
 
         // lineary mapped from [0..100] to [0..255]
         for (size_t i = 0; i < 256; ++i) {
@@ -217,13 +212,14 @@ private:
 
     struct Frontier {
         Point centroid;
-        vector<Point> points;
-        string getKey() const { return to_string(centroid.x) + "," + to_string(centroid.y); }
+        std::vector<Point> points;
+        std::string getKey() const { return std::to_string(centroid.x) + "," + std::to_string(centroid.y); }
     };
 
     double frontierDistance(const Frontier & frontier, const Point & position) const {
-        return sqrt(pow((double(frontier.centroid.x) - double(position.x)), 2.0) +
-                    pow((double(frontier.centroid.y) - double(position.y)), 2.0));
+        const double dx = frontier.centroid.x - position.x;
+        const double dy = frontier.centroid.y - position.y;
+        return std::sqrt(dx * dx + dy * dy);
     }
 
     bool isBlacklisted(const Point & p) const {
@@ -248,8 +244,8 @@ private:
     double robotYaw() const {
         if (!pose_) return 0.0;
         const auto & q = pose_->pose.pose.orientation;
-        return atan2(2.0 * (q.w * q.z + q.x * q.y),
-                     1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+        return std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+                          1.0 - 2.0 * (q.y * q.y + q.z * q.z));
     }
 
     double scoreFrontier(const Frontier & frontier, const Point & position) const {
@@ -264,10 +260,10 @@ private:
         if (forward_weight_ > 0.0 && distance > 0.5) {
             double dx = frontier.centroid.x - position.x;
             double dy = frontier.centroid.y - position.y;
-            double norm = sqrt(dx * dx + dy * dy);
+            double norm = std::sqrt(dx * dx + dy * dy);
             double yaw = robotYaw();
             // dot ∈ [-1, 1]: +1 = directly ahead, -1 = directly behind
-            double dot = (dx * cos(yaw) + dy * sin(yaw)) / norm;
+            double dot = (dx * std::cos(yaw) + dy * std::sin(yaw)) / norm;
             // Map to [0, 1] so behind = 0, ahead = 1, side = 0.5
             double forward_factor = (dot + 1.0) / 2.0;
             forward_bonus = forward_weight_ * forward_factor * clamped_distance;
@@ -334,7 +330,7 @@ private:
 
         // lock as we are accessing raw underlying map
         auto *mutex = costmap_.getMutex();
-        lock_guard<Costmap2D::mutex_t> lock(*mutex);
+        std::lock_guard<Costmap2D::mutex_t> lock(*mutex);
 
         // fill map with data
         unsigned char *costmap_data = costmap_.getCharMap();
@@ -409,7 +405,7 @@ private:
         return refined;
     }
 
-    void drawMarkers(const vector<Frontier> &frontiers) {
+    void drawMarkers(const std::vector<Frontier> &frontiers) {
         // Send a DELETEALL first so RViz/Trillium drops markers from the previous
         // frame before we publish the current ones. Without this the local
         // markersMsg_ would either grow unbounded across calls (visual stale
@@ -502,7 +498,7 @@ private:
         if (isExploring_ || isStopped_ || !enabled_) { return; }
         if (steady_clock::now() < next_explore_time_) {
             if (!hasNavigated_) {
-                auto remaining = chrono::duration_cast<chrono::seconds>(
+                auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
                     next_explore_time_ - steady_clock::now()).count();
                 if (remaining > 0) {
                     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -663,15 +659,15 @@ private:
         RCLCPP_INFO(get_logger(), "Save map request sent for map at %s", mapPath_.c_str());
     }
 
-    vector<unsigned int> nhood8(unsigned int idx) {
+    std::vector<unsigned int> nhood8(unsigned int idx) {
         unsigned int mx, my;
-        vector<unsigned int> out;
+        std::vector<unsigned int> out;
         costmap_.indexToCells(idx, mx, my);
         const int x = static_cast<int>(mx);
         const int y = static_cast<int>(my);
         const int sx = static_cast<int>(costmap_.getSizeInCellsX());
         const int sy = static_cast<int>(costmap_.getSizeInCellsY());
-        const pair<int, int> directions[] = {
+        const std::pair<int, int> directions[] = {
                 {-1, -1}, {-1, 1}, {1, -1}, {1, 1},
                 {1, 0}, {-1, 0}, {0, 1}, {0, -1}
         };
@@ -694,7 +690,7 @@ private:
     }
 
     bool isAchievableFrontierCell(unsigned int idx,
-                                  const vector<bool> &frontier_flag) {
+                                  const std::vector<bool> &frontier_flag) {
         auto map = costmap_.getCharMap();
         // check that cell is unknown and not already marked as frontier
         if (map[idx] != NO_INFORMATION || frontier_flag[idx]) {
@@ -714,12 +710,12 @@ private:
         return false;
     }
 
-    Frontier buildNewFrontier(unsigned int neighborCell, vector<bool> &frontier_flag) {
+    Frontier buildNewFrontier(unsigned int neighborCell, std::vector<bool> &frontier_flag) {
         Frontier output;
         output.centroid.x = 0;
         output.centroid.y = 0;
 
-        queue<unsigned int> bfs;
+        std::queue<unsigned int> bfs;
         bfs.push(neighborCell);
 
         // Include the seed cell itself. The caller has already set
@@ -776,8 +772,8 @@ private:
         return output;
     }
 
-    vector<Frontier> findFrontiers() {
-        vector<Frontier> frontier_list;
+    std::vector<Frontier> findFrontiers() {
+        std::vector<Frontier> frontier_list;
         const auto position = pose_->pose.pose.position;
         unsigned int mx, my;
         if (!costmap_.worldToMap(position.x, position.y, mx, my)) {
@@ -786,20 +782,20 @@ private:
         }
 
         // make sure map is consistent and locked for duration of search
-        lock_guard<Costmap2D::mutex_t> lock(*(costmap_.getMutex()));
+        std::lock_guard<Costmap2D::mutex_t> lock(*(costmap_.getMutex()));
 
         auto map_ = costmap_.getCharMap();
         auto size_x_ = costmap_.getSizeInCellsX();
         auto size_y_ = costmap_.getSizeInCellsY();
 
         // initialize flag arrays to keep track of visited and frontier cells
-        vector<bool> frontier_flag(size_x_ * size_y_,
+        std::vector<bool> frontier_flag(size_x_ * size_y_,
                                    false);
-        vector<bool> visited_flag(size_x_ * size_y_,
+        std::vector<bool> visited_flag(size_x_ * size_y_,
                                   false);
 
         // initialize breadth first search
-        queue<unsigned int> bfs;
+        std::queue<unsigned int> bfs;
 
         unsigned int pos = costmap_.getIndex(mx, my);
 
@@ -807,8 +803,8 @@ private:
         // robot's immediate vicinity has no lidar rays), search outward for the nearest
         // traversable cell and seed the BFS from there instead.
         if (!isTraversable(map_[pos])) {
-            queue<unsigned int> seed_bfs;
-            vector<bool> seed_visited(size_x_ * size_y_, false);
+            std::queue<unsigned int> seed_bfs;
+            std::vector<bool> seed_visited(size_x_ * size_y_, false);
             seed_bfs.push(pos);
             seed_visited[pos] = true;
             bool found_free = false;
@@ -874,8 +870,8 @@ private:
 };
 
 int main(int argc, char *argv[]) {
-    init(argc, argv);
-    spin(make_shared<AutoMapper>());
-    shutdown();
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<AutoMapper>());
+    rclcpp::shutdown();
     return 0;
 }
