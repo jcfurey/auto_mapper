@@ -491,6 +491,11 @@ private:
         } else {
             RCLCPP_INFO(get_logger(), "Exploration enabled via service.");
             next_explore_time_ = steady_clock::now();
+            // Treat re-arm as a fresh start so the "Exploration starts in N
+            // seconds…" countdown is not suppressed and exhaustionMapSaved_
+            // resets cleanly when the next batch of frontiers shows up.
+            hasNavigated_ = false;
+            exhaustionMapSaved_ = false;
             response->message = "exploration enabled";
             // explore() will be triggered by the next OccupancyGrid callback.
         }
