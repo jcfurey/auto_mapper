@@ -155,8 +155,8 @@ private:
     MarkerArray markersMsg_;
     rclcpp::Subscription<OccupancyGrid>::SharedPtr mapSubscription_;
     bool isExploring_ = false;
-    bool isStopped_ = false;  // true once stop() has been called — prevents result_callback cascade
-    bool enabled_ = true;     // runtime soft-toggle via ~/set_enabled; distinct from isStopped_
+    bool enabled_ = true;     // runtime soft-toggle via ~/set_enabled
+    bool exhaustionMapSaved_ = false;  // throttle saveMap() to once per "no frontiers left" episode
     steady_clock::time_point next_explore_time_ = steady_clock::now();  // backoff after rejection
     int markerId_ = 0;
 
@@ -447,26 +447,9 @@ private:
         markerArrayPublisher_->publish(markersMsg_);
     }
 
-    void stop() {
-        if (isStopped_) return;  // prevent cascading stop from result_callbacks
-        isStopped_ = true;
-        RCLCPP_INFO(get_logger(), "Stopped...");
-        odomSubscription_.reset();
-        poseSubscription_.reset();
-        mapSubscription_.reset();
-        poseNavigator_->async_cancel_all_goals();
-        saveMap();
-        clearMarkers();
-    }
-
     void setEnabledCallback(
         const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
         std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
-        if (isStopped_) {
-            response->success = false;
-            response->message = "AutoMapper has terminated (exploration complete) — relaunch to restart.";
-            return;
-        }
         const bool prev = enabled_;
         enabled_ = request->data;
         if (enabled_ == prev) {
@@ -490,7 +473,7 @@ private:
     }
 
     void explore() {
-        if (isExploring_ || isStopped_ || !enabled_) { return; }
+        if (isExploring_ || !enabled_) { return; }
         if (steady_clock::now() < next_explore_time_) {
             if (!hasNavigated_) {
                 auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
@@ -526,10 +509,22 @@ private:
                     blacklist_.size());
                 return;
             }
-            RCLCPP_WARN(get_logger(), "No frontiers remaining — exploration complete.");
-            stop();
+            // No frontiers remain. Don't tear the node down — the map can grow
+            // when the robot rounds a corner an hour later, or when an operator
+            // pushes the rover into a new area; we want to resume automatically.
+            // Save the map once per exhaustion episode so we don't spam the
+            // map_saver with every map update while idle.
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+                "No frontiers remaining — exploration appears complete. "
+                "Will resume if new frontiers appear in future map updates.");
+            if (!exhaustionMapSaved_) {
+                saveMap();
+                exhaustionMapSaved_ = true;
+            }
             return;
         }
+        // We have frontiers again — re-arm the one-shot save.
+        exhaustionMapSaved_ = false;
         const auto robot_position = pose_->pose.pose.position;
         const auto frontier_it = std::max_element(
             frontiers.begin(), frontiers.end(),
