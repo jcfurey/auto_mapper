@@ -696,23 +696,34 @@ private:
         RCLCPP_INFO(get_logger(), "Save map request sent for map at %s", mapPath_.c_str());
     }
 
-    std::vector<unsigned int> nhood8(unsigned int idx) {
+    // 8-connected neighbor offsets. static so we don't reconstruct on every
+    // nhood8 call, which used to fire 8–10 M times per map update.
+    static constexpr std::array<std::pair<int, int>, 8> kNhood8Directions_ = {{
+        {-1, -1}, {-1, 1}, {1, -1}, {1, 1},
+        {1, 0}, {-1, 0}, {0, 1}, {0, -1}
+    }};
+
+    // Fixed-size neighbor result. .first = count of valid neighbors written
+    // into the array. Returning by value is fine — std::array of 8 ints is
+    // small and the caller iterates [0, count).
+    struct Neighbors8 {
+        std::array<unsigned int, 8> idx;
+        std::size_t count;
+    };
+
+    Neighbors8 nhood8(unsigned int idx) const {
+        Neighbors8 out{};
         unsigned int mx, my;
-        std::vector<unsigned int> out;
         costmap_.indexToCells(idx, mx, my);
         const int x = static_cast<int>(mx);
         const int y = static_cast<int>(my);
         const int sx = static_cast<int>(costmap_.getSizeInCellsX());
         const int sy = static_cast<int>(costmap_.getSizeInCellsY());
-        const std::pair<int, int> directions[] = {
-                {-1, -1}, {-1, 1}, {1, -1}, {1, 1},
-                {1, 0}, {-1, 0}, {0, 1}, {0, -1}
-        };
-        for (const auto &d: directions) {
-            int newX = x + d.first;
-            int newY = y + d.second;
+        for (const auto &d : kNhood8Directions_) {
+            const int newX = x + d.first;
+            const int newY = y + d.second;
             if (newX >= 0 && newX < sx && newY >= 0 && newY < sy) {
-                out.push_back(costmap_.getIndex(newX, newY));
+                out.idx[out.count++] = costmap_.getIndex(newX, newY);
             }
         }
         return out;
@@ -736,7 +747,9 @@ private:
 
         // check there's enough traversable space for robot to approach frontier
         int freeCount = 0;
-        for (unsigned int nbr: nhood8(idx)) {
+        const auto nbrs = nhood8(idx);
+        for (std::size_t i = 0; i < nbrs.count; ++i) {
+            const unsigned int nbr = nbrs.idx[i];
             if (isTraversable(map[nbr])) {
                 if (++freeCount >= min_free_threshold_) {
                     return true;
@@ -779,7 +792,9 @@ private:
             bfs.pop();
 
             // try adding cells in 8-connected neighborhood to frontier
-            for (unsigned int nbr: nhood8(idx)) {
+            const auto nbrs = nhood8(idx);
+            for (std::size_t i = 0; i < nbrs.count; ++i) {
+                const unsigned int nbr = nbrs.idx[i];
                 // check if neighbour is a potential frontier cell
                 if (isAchievableFrontierCell(nbr, frontier_flag)) {
                     // mark cell as frontier
@@ -852,7 +867,9 @@ private:
                 unsigned int idx = seed_bfs.front();
                 seed_bfs.pop();
                 ++seed_iters;
-                for (unsigned int nbr : nhood8(idx)) {
+                const auto seed_nbrs = nhood8(idx);
+                for (std::size_t i = 0; i < seed_nbrs.count; ++i) {
+                    const unsigned int nbr = seed_nbrs.idx[i];
                     if (seed_visited[nbr]) continue;
                     seed_visited[nbr] = true;
                     if (isTraversable(map_[nbr])) {
@@ -880,7 +897,9 @@ private:
             unsigned int idx = bfs.front();
             bfs.pop();
 
-            for (unsigned nbr: nhood8(idx)) {
+            const auto nbrs = nhood8(idx);
+            for (std::size_t i = 0; i < nbrs.count; ++i) {
+                const unsigned int nbr = nbrs.idx[i];
                 // Expand through all traversable cells (free + inflated).
                 // Using FREE_SPACE alone blocks the BFS at inflation boundaries,
                 // making corridors narrower than 2×inflation_radius unreachable.
