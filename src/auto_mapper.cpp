@@ -344,17 +344,21 @@ private:
                            origin_x,
                            origin_y);
 
-        // lock as we are accessing raw underlying map
-        auto *mutex = costmap_.getMutex();
-        std::lock_guard<Costmap2D::mutex_t> lock(*mutex);
-
-        // fill map with data
-        unsigned char *costmap_data = costmap_.getCharMap();
-        size_t costmap_size = costmap_.getSizeInCellsX() * costmap_.getSizeInCellsY();
-        RCLCPP_DEBUG(get_logger(), "full map update, %lu values", costmap_size);
-        for (size_t i = 0; i < costmap_size && i < occupancyGrid->data.size(); ++i) {
-            auto cell_cost = static_cast<unsigned char>(occupancyGrid->data[i]);
-            costmap_data[i] = costTranslationTable_[cell_cost];
+        // Hold the costmap mutex only for the bulk write, not for the
+        // findFrontiers BFS that explore() kicks off. findFrontiers re-acquires
+        // the same mutex itself; under the previous structure this happened to
+        // work because Costmap2D::mutex_t is a std::recursive_mutex, but
+        // load-bearing recursion that isn't documented locally is a footgun.
+        // Scope the lock to the fill, then call explore() unlocked.
+        {
+            std::lock_guard<Costmap2D::mutex_t> lock(*costmap_.getMutex());
+            unsigned char *costmap_data = costmap_.getCharMap();
+            size_t costmap_size = costmap_.getSizeInCellsX() * costmap_.getSizeInCellsY();
+            RCLCPP_DEBUG(get_logger(), "full map update, %lu values", costmap_size);
+            for (size_t i = 0; i < costmap_size && i < occupancyGrid->data.size(); ++i) {
+                auto cell_cost = static_cast<unsigned char>(occupancyGrid->data[i]);
+                costmap_data[i] = costTranslationTable_[cell_cost];
+            }
         }
 
         explore();
