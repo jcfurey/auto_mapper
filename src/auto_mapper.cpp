@@ -165,7 +165,7 @@ private:
     bool isStopped_ = false;  // true once stop() has been called — prevents result_callback cascade
     bool enabled_ = true;     // runtime soft-toggle via ~/set_enabled; distinct from isStopped_
     steady_clock::time_point next_explore_time_ = steady_clock::now();  // backoff after rejection
-    int markerId_;
+    int markerId_ = 0;
 
     // Blacklist: rejected goal locations are remembered so the same frontier
     // centroid is not re-selected on the next map update.  Each entry stores
@@ -185,6 +185,7 @@ private:
     Subscription<PoseStamped>::SharedPtr poseSubscription_;  // geometry_msgs/PoseStamped (pose_topic)
     PoseWithCovarianceStamped::UniquePtr pose_;
     bool hasNavigated_ = false;  // true once at least one goal has been accepted
+    string mapFrameId_ = "map";  // frame_id of the most recent OccupancyGrid; used for marker headers
 
     array<unsigned char, 256> costTranslationTable_ = initTranslationTable();
 
@@ -301,6 +302,7 @@ private:
             return;
         }
         RCLCPP_DEBUG(get_logger(), "updateFullMap...");
+        mapFrameId_ = occupancyGrid->header.frame_id;
         const auto occupancyGridInfo = occupancyGrid->info;
         unsigned int size_in_cells_x = occupancyGridInfo.width;
         unsigned int size_in_cells_y = occupancyGridInfo.height;
@@ -394,21 +396,29 @@ private:
     }
 
     void drawMarkers(const vector<Frontier> &frontiers) {
+        // Send a DELETEALL first so RViz/Trillium drops markers from the previous
+        // frame before we publish the current ones. Without this the local
+        // markersMsg_ would either grow unbounded across calls (visual stale
+        // cruft) or, if cleared, leave RViz holding orphans from earlier ADDs.
+        markersMsg_.markers.clear();
+        Marker delete_all;
+        delete_all.action = Marker::DELETEALL;
+        delete_all.ns = "frontiers";
+        markersMsg_.markers.push_back(delete_all);
+
+        ColorRGBA green;
+        green.r = 0.0;
+        green.g = 1.0;
+        green.b = 0.0;
+        green.a = 1.0;
+
+        const auto stamp = now();
         for (const auto &frontier: frontiers) {
             RCLCPP_DEBUG(get_logger(), "visualising %f,%f ", frontier.centroid.x, frontier.centroid.y);
-            ColorRGBA green;
-            green.r = 0;
-            green.g = 1.0;
-            green.b = 0;
-            green.a = 1.0;
-
-            vector<Marker> &markers = markersMsg_.markers;
             Marker m;
-
-            m.header.frame_id = "map";
-            m.header.stamp = now();
+            m.header.frame_id = mapFrameId_;
+            m.header.stamp = stamp;
             m.frame_locked = true;
-
             m.action = Marker::ADD;
             m.ns = "frontiers";
             m.id = ++markerId_;
@@ -418,15 +428,17 @@ private:
             m.scale.y = 0.3;
             m.scale.z = 0.3;
             m.color = green;
-            markers.push_back(m);
-            markerArrayPublisher_->publish(markersMsg_);
+            markersMsg_.markers.push_back(m);
         }
+        markerArrayPublisher_->publish(markersMsg_);
     }
 
     void clearMarkers() {
-        for (auto &m: markersMsg_.markers) {
-            m.action = Marker::DELETE;
-        }
+        markersMsg_.markers.clear();
+        Marker delete_all;
+        delete_all.action = Marker::DELETEALL;
+        delete_all.ns = "frontiers";
+        markersMsg_.markers.push_back(delete_all);
         markerArrayPublisher_->publish(markersMsg_);
     }
 
