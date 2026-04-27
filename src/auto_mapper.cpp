@@ -1,7 +1,3 @@
-//
-// Edited by gglapell on 7/10/25.
-//
-
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -155,7 +151,7 @@ private:
     MarkerArray markersMsg_;
     rclcpp::Subscription<OccupancyGrid>::SharedPtr mapSubscription_;
     bool isExploring_ = false;
-    bool enabled_ = true;     // runtime soft-toggle via ~/set_enabled
+    bool enabled_;           // runtime soft-toggle via ~/set_enabled — written from declare_parameter("start_enabled")
     bool exhaustionMapSaved_ = false;  // throttle saveMap() to once per "no frontiers left" episode
     steady_clock::time_point next_explore_time_ = steady_clock::now();  // backoff after rejection
     int markerId_ = 0;
