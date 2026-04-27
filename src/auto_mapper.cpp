@@ -626,11 +626,15 @@ private:
         auto goal_y = goal_point.y;
         send_goal_options.result_callback = [this, goal_x, goal_y](const GoalHandleNavigateToPose::WrappedResult &result) {
             isExploring_ = false;
-            saveMap();
             clearMarkers();
             switch (result.code) {
                 case rclcpp_action::ResultCode::SUCCEEDED:
                     RCLCPP_INFO(get_logger(), "Goal reached");
+                    // Only snapshot the map on a successful arrival. Saving on
+                    // ABORTED ("we hit a wall") or CANCELED ("operator paused")
+                    // is at best wasteful and at worst captures a degenerate
+                    // robot pose into the persisted map.
+                    saveMap();
                     break;
                 case rclcpp_action::ResultCode::ABORTED:
                     RCLCPP_WARN(get_logger(), "Goal (%.2f, %.2f) aborted — blacklisting", goal_x, goal_y);
