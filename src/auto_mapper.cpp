@@ -556,18 +556,29 @@ private:
         // MAX_ACCEPTABLE_COST_ threshold as refineGoalClearance — if the two
         // disagree a borderline cell can pass refinement and fail validation
         // (or vice versa) on the same goal.
+        //
+        // Also reject if the goal is outside the costmap entirely. Previously
+        // this branch silently fell through and dispatched the goal anyway,
+        // which can happen when refineGoalClearance returns the original
+        // centroid because worldToMap failed there too.
         {
             unsigned int goal_mx, goal_my;
-            if (costmap_.worldToMap(goal_point.x, goal_point.y, goal_mx, goal_my)) {
-                auto cost = costmap_.getCost(goal_mx, goal_my);
-                if (cost > MAX_ACCEPTABLE_COST_) {
-                    RCLCPP_WARN(get_logger(),
-                        "Goal (%.2f, %.2f) is inside obstacle (cost=%d) — blacklisting",
-                        goal_point.x, goal_point.y, cost);
-                    blacklist_.push_back({goal_point.x, goal_point.y, steady_clock::now()});
-                    next_explore_time_ = steady_clock::now() + 1s;
-                    return;
-                }
+            if (!costmap_.worldToMap(goal_point.x, goal_point.y, goal_mx, goal_my)) {
+                RCLCPP_WARN(get_logger(),
+                    "Goal (%.2f, %.2f) is outside the costmap — blacklisting",
+                    goal_point.x, goal_point.y);
+                blacklist_.push_back({goal_point.x, goal_point.y, steady_clock::now()});
+                next_explore_time_ = steady_clock::now() + 1s;
+                return;
+            }
+            const auto cost = costmap_.getCost(goal_mx, goal_my);
+            if (cost > MAX_ACCEPTABLE_COST_) {
+                RCLCPP_WARN(get_logger(),
+                    "Goal (%.2f, %.2f) is inside obstacle (cost=%d) — blacklisting",
+                    goal_point.x, goal_point.y, cost);
+                blacklist_.push_back({goal_point.x, goal_point.y, steady_clock::now()});
+                next_explore_time_ = steady_clock::now() + 1s;
+                return;
             }
         }
 
