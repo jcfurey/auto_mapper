@@ -689,6 +689,25 @@ private:
         queue<unsigned int> bfs;
         bfs.push(neighborCell);
 
+        // Include the seed cell itself. The caller has already set
+        // frontier_flag[neighborCell] = true, but never pushes the cell into
+        // output.points — the BFS loop below only inspects *neighbors* of cells
+        // in the queue. A single-cell frontier (no other achievable-frontier
+        // neighbors) would otherwise leave output.points empty, and the
+        // size-divide at the bottom of this function would NaN out the centroid.
+        {
+            unsigned int seed_mx, seed_my;
+            double seed_wx, seed_wy;
+            costmap_.indexToCells(neighborCell, seed_mx, seed_my);
+            costmap_.mapToWorld(seed_mx, seed_my, seed_wx, seed_wy);
+            Point seed_point;
+            seed_point.x = seed_wx;
+            seed_point.y = seed_wy;
+            output.points.push_back(seed_point);
+            output.centroid.x += seed_wx;
+            output.centroid.y += seed_wy;
+        }
+
         while (!bfs.empty()) {
             unsigned int idx = bfs.front();
             bfs.pop();
