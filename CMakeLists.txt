@@ -12,34 +12,14 @@ if (CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   )
 endif ()
 
-find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_auto REQUIRED)
+ament_auto_find_build_dependencies()
 
-# Only the deps actually included by src/auto_mapper.cpp.
-set(deps
-        rclcpp
-        rclcpp_action
-        geometry_msgs
-        nav_msgs
-        nav2_msgs
-        nav2_costmap_2d
-        std_msgs
-        std_srvs
-        visualization_msgs)
-
-foreach (d ${deps})
-  find_package(${d} REQUIRED)
-endforeach ()
-
-add_executable(auto_mapper src/auto_mapper.cpp)
-ament_target_dependencies(auto_mapper ${deps})
-
-install(TARGETS
-        auto_mapper
-        DESTINATION lib/${PROJECT_NAME})
+ament_auto_add_executable(auto_mapper src/auto_mapper.cpp)
 
 install(
         DIRECTORY rviz
         DESTINATION share/${PROJECT_NAME}
 )
 
-ament_package()
+ament_auto_package()
