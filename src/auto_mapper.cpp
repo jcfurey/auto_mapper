@@ -571,7 +571,9 @@ private:
                 RCLCPP_WARN(get_logger(),
                     "Goal (%.2f, %.2f) is outside the costmap — blacklisting",
                     goal_point.x, goal_point.y);
-                blacklist_.push_back({goal_point.x, goal_point.y, steady_clock::now()});
+                auto_mapper::blacklist_rejected_goal(
+                    blacklist_, goal_point.x, goal_point.y,
+                    frontier.centroid.x, frontier.centroid.y, steady_clock::now());
                 next_explore_time_ = steady_clock::now() + 1s;
                 return;
             }
@@ -580,7 +582,9 @@ private:
                 RCLCPP_WARN(get_logger(),
                     "Goal (%.2f, %.2f) is inside obstacle (cost=%d) — blacklisting",
                     goal_point.x, goal_point.y, cost);
-                blacklist_.push_back({goal_point.x, goal_point.y, steady_clock::now()});
+                auto_mapper::blacklist_rejected_goal(
+                    blacklist_, goal_point.x, goal_point.y,
+                    frontier.centroid.x, frontier.centroid.y, steady_clock::now());
                 next_explore_time_ = steady_clock::now() + 1s;
                 return;
             }
@@ -625,10 +629,15 @@ private:
                 "Distance remaining: %.2f m", feedback->distance_remaining);
         };
 
-        // Capture goal position for blacklisting on abort
-        auto goal_x = goal_point.x;
-        auto goal_y = goal_point.y;
-        send_goal_options.result_callback = [this, goal_x, goal_y](
+        // Capture goal and centroid positions for blacklisting on abort —
+        // both points, because refinement can displace the goal farther from
+        // the centroid than blacklist_radius_m_ covers (see
+        // blacklist_rejected_goal in exploration_logic.hpp).
+        const auto goal_x = goal_point.x;
+        const auto goal_y = goal_point.y;
+        const auto centroid_x = frontier.centroid.x;
+        const auto centroid_y = frontier.centroid.y;
+        send_goal_options.result_callback = [this, goal_x, goal_y, centroid_x, centroid_y](
                 const GoalHandleNavigateToPose::WrappedResult &result) {
             isExploring_ = false;
             clearMarkers();
@@ -644,7 +653,9 @@ private:
                 case rclcpp_action::ResultCode::ABORTED:
                     RCLCPP_WARN(get_logger(), "Goal (%.2f, %.2f) aborted — blacklisting",
                         goal_x, goal_y);
-                    blacklist_.push_back({goal_x, goal_y, steady_clock::now()});
+                    auto_mapper::blacklist_rejected_goal(
+                        blacklist_, goal_x, goal_y, centroid_x, centroid_y,
+                        steady_clock::now());
                     break;
                 case rclcpp_action::ResultCode::CANCELED:
                     RCLCPP_ERROR(get_logger(), "Goal was canceled");

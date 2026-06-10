@@ -163,6 +163,28 @@ inline bool is_blacklisted(
     });
 }
 
+/// Blacklist a rejected/aborted goal together with the frontier centroid it
+/// was refined from.
+///
+/// Goal refinement can displace the dispatched goal by up to
+/// goal_clearance_radius_m from the centroid, which by default exceeds
+/// blacklist_radius_m. Blacklisting only the refined goal point then fails
+/// to cover the centroid: the same frontier survives the blacklist filter
+/// on the next map update, refines to the same rejected goal, and is
+/// rejected again — a livelock until the map happens to change. Recording
+/// both points closes that gap.
+inline void blacklist_rejected_goal(
+  std::vector<BlacklistEntry> & entries,
+  double goal_x, double goal_y,
+  double centroid_x, double centroid_y,
+  std::chrono::steady_clock::time_point now)
+{
+  entries.push_back({goal_x, goal_y, now});
+  if (goal_x != centroid_x || goal_y != centroid_y) {
+    entries.push_back({centroid_x, centroid_y, now});
+  }
+}
+
 /// Drop entries older than duration_sec (measured against `now`).
 inline void prune_blacklist(
   std::vector<BlacklistEntry> & entries,

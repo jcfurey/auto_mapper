@@ -199,6 +199,36 @@ TEST(Blacklist, PruneDropsOnlyExpiredEntries)
   EXPECT_DOUBLE_EQ(entries[1].x, 3.0);
 }
 
+TEST(Blacklist, RejectedGoalBlocksBothGoalAndCentroid)
+{
+  // Livelock regression: with default parameters, goal refinement may move
+  // the goal up to 1.5 m from the centroid while the blacklist radius is
+  // only 1.0 m. Blacklisting just the goal point left the centroid eligible
+  // for re-selection, re-refinement to the same bad goal, and re-rejection
+  // every cycle. Both points must be covered after a rejection.
+  const double kBlacklistRadius = 1.0;
+  const double centroid_x = 0.0, centroid_y = 0.0;
+  const double goal_x = 1.4, goal_y = 0.0;  // displaced beyond the radius
+
+  std::vector<BlacklistEntry> entries;
+  auto_mapper::blacklist_rejected_goal(
+    entries, goal_x, goal_y, centroid_x, centroid_y, steady_clock::now());
+
+  EXPECT_TRUE(
+    auto_mapper::is_blacklisted(entries, goal_x, goal_y, kBlacklistRadius));
+  EXPECT_TRUE(
+    auto_mapper::is_blacklisted(entries, centroid_x, centroid_y, kBlacklistRadius));
+}
+
+TEST(Blacklist, RejectedGoalDedupesUndisplacedCentroid)
+{
+  // When refinement did not move the goal, one entry is enough.
+  std::vector<BlacklistEntry> entries;
+  auto_mapper::blacklist_rejected_goal(
+    entries, 2.0, 3.0, 2.0, 3.0, steady_clock::now());
+  EXPECT_EQ(entries.size(), 1u);
+}
+
 TEST(Blacklist, PruneKeepsEntryExactlyAtExpiry)
 {
   // (now - when) > duration is strict, so an entry exactly at the boundary
