@@ -46,6 +46,7 @@ with substantial divergence — see **Differences from upstream** below.
 | `goal_clearance_radius_m` | `1.5` | Search this radius around the centroid for the lowest-cost cell to use as the goal. 0 disables. |
 | `blacklist_radius_m` | `1.0` | Re-reject frontiers whose centroid is within this radius of a recently rejected goal. |
 | `blacklist_duration_sec` | `60.0` | Blacklist entries expire after this many seconds. |
+| `goal_timeout_sec` | `300.0` | Watchdog: cancel a goal whose result hasn't arrived within this time (e.g. Nav2 died mid-goal) and resume exploring. `0` disables. |
 
 ## Differences from upstream
 

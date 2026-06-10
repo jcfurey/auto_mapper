@@ -95,6 +95,7 @@ public:
         goal_clearance_radius_m_ = declare_parameter<double>("goal_clearance_radius_m", 1.5);
         blacklist_radius_m_ = declare_parameter<double>("blacklist_radius_m", 1.0);
         blacklist_duration_sec_ = declare_parameter<double>("blacklist_duration_sec", 60.0);
+        goal_timeout_sec_ = declare_parameter<double>("goal_timeout_sec", 300.0);
 
         const double startup_delay_sec = declare_parameter<double>("startup_delay_sec", 0.0);
         if (startup_delay_sec > 0.0) {
@@ -145,6 +146,14 @@ public:
             std::bind(&AutoMapper::setEnabledCallback, this,
                 std::placeholders::_1, std::placeholders::_2));
 
+        // Watchdog for goals whose result never arrives (e.g. the Nav2
+        // action server crashed mid-goal): without it isExploring_ stays
+        // latched true and exploration is wedged until the node restarts.
+        if (goal_timeout_sec_ > 0.0) {
+            watchdogTimer_ = create_wall_timer(
+                5s, std::bind(&AutoMapper::checkGoalWatchdog, this));
+        }
+
         // Wait for the navigate_to_pose action server, but yield to the executor
         // so the node can be interrupted (e.g. Ctrl-C) while waiting.
         while (!poseNavigator_->wait_for_action_server(1s)) {
@@ -177,6 +186,10 @@ private:
     MarkerArray markersMsg_;
     rclcpp::Subscription<OccupancyGrid>::SharedPtr mapSubscription_;
     bool isExploring_ = false;
+    // Goal watchdog: cancel and resume if no result arrives by the deadline.
+    double goal_timeout_sec_;  // ROS param — 0 disables the watchdog
+    steady_clock::time_point goal_deadline_ = steady_clock::time_point::max();
+    rclcpp::TimerBase::SharedPtr watchdogTimer_;
     // Runtime soft-toggle via ~/set_enabled — written from declare_parameter("start_enabled").
     bool enabled_;
     bool exhaustionMapSaved_ = false;  // throttle saveMap() to once per "no frontiers left" episode
@@ -479,6 +492,25 @@ private:
         response->success = true;
     }
 
+    // Runs every 5 s. If a dispatched goal produced neither a response nor a
+    // result by goal_deadline_ — the Nav2 server died mid-goal, or navigation
+    // hung — cancel it and let the next map update re-enter explore().
+    // A straggling result_callback after this fires is harmless: it re-clears
+    // isExploring_ and calls explore(), which is idempotent here.
+    void checkGoalWatchdog() {
+        if (!isExploring_ || steady_clock::now() < goal_deadline_) {
+            return;
+        }
+        RCLCPP_WARN(get_logger(),
+            "Goal did not complete within %.0f s (goal_timeout_sec) — "
+            "cancelling and resuming exploration.",
+            goal_timeout_sec_);
+        poseNavigator_->async_cancel_all_goals();
+        clearMarkers();
+        isExploring_ = false;
+        next_explore_time_ = steady_clock::now() + 5s;
+    }
+
     void explore() {
         if (isExploring_ || !enabled_) {
             return;
@@ -607,6 +639,10 @@ private:
         // Set exploring flag synchronously BEFORE async_send_goal to prevent
         // updateFullMap() from calling explore() again before the response arrives.
         isExploring_ = true;
+        goal_deadline_ = goal_timeout_sec_ > 0.0
+            ? steady_clock::now() + std::chrono::duration_cast<steady_clock::duration>(
+                  std::chrono::duration<double>(goal_timeout_sec_))
+            : steady_clock::time_point::max();
 
         auto send_goal_options = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
         send_goal_options.goal_response_callback = [this](
