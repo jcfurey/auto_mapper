@@ -5,8 +5,8 @@
   <version>0.1.0</version>
   <description>Autonomous frontier-based exploration using any OccupancyGrid map source</description>
   <maintainer email="jcfurey@users.noreply.github.com">jcfurey</maintainer>
-  <author email="omar.gamil.salem@gmail.com">Omar Salem</author>
   <license>Apache-2.0</license>
+  <author email="omar.gamil.salem@gmail.com">Omar Salem</author>
 
   <buildtool_depend>ament_cmake_auto</buildtool_depend>
 

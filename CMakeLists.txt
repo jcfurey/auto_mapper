@@ -36,4 +36,6 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
-ament_auto_package()
+# Scoped header install (include/auto_mapper instead of include) — the
+# default from ROS 2 Kilted onward; silences the ament_auto deprecation note.
+ament_auto_package(USE_SCOPED_HEADER_INSTALL_DIR)
