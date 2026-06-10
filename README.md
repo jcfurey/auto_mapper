@@ -46,6 +46,7 @@ with substantial divergence — see **Differences from upstream** below.
 | `goal_clearance_radius_m` | `1.5` | Search this radius around the centroid for the lowest-cost cell to use as the goal. 0 disables. |
 | `blacklist_radius_m` | `1.0` | Re-reject frontiers whose centroid is within this radius of a recently rejected goal. |
 | `blacklist_duration_sec` | `60.0` | Blacklist entries expire after this many seconds. |
+| `goal_timeout_sec` | `300.0` | Watchdog: cancel a goal whose result hasn't arrived within this time (e.g. Nav2 died mid-goal) and resume exploring. `0` disables. |
 
 ## Differences from upstream
 
@@ -67,6 +68,33 @@ with substantial divergence — see **Differences from upstream** below.
 - `~/set_enabled` runtime soft-toggle.
 - Re-arms automatically after frontier exhaustion (no `stop()`
   latching).
+
+## Development
+
+The pure exploration logic (cost translation table, traversability,
+frontier scoring, goal blacklist) lives in
+`include/auto_mapper/exploration_logic.hpp`, which is ROS-free and
+unit-tested in `test/test_exploration_logic.cpp`. Build and run the
+tests, plus the ament linters (copyright, cpplint, cppcheck, xmllint,
+lint_cmake), with:
+
+```bash
+colcon build --packages-select auto_mapper
+colcon test --packages-select auto_mapper
+colcon test-result --verbose
+```
+
+The header has no ROS dependencies, so the tests also build standalone:
+
+```bash
+g++ -std=c++17 -Wall -Wextra -Iinclude test/test_exploration_logic.cpp \
+  -lgtest -o /tmp/test_logic && /tmp/test_logic
+```
+
+`ament_uncrustify` is excluded from the lint set — the codebase keeps
+its original formatting. Run `ament_uncrustify --reformat src include
+test` and drop the exclusion in `CMakeLists.txt` to adopt the ament
+style.
 
 ## Acknowledgements
 
