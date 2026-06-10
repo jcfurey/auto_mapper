@@ -330,23 +330,32 @@ private:
 
         RCLCPP_DEBUG(get_logger(), "received full new map, resizing to: %u, %u", size_in_cells_x,
                     size_in_cells_y);
-        costmap_.resizeMap(size_in_cells_x,
-                           size_in_cells_y,
-                           resolution,
-                           origin_x,
-                           origin_y);
 
-        // Hold the costmap mutex only for the bulk write, not for the
+        // Hold the costmap mutex for the resize + bulk write, but not for the
         // findFrontiers BFS that explore() kicks off. findFrontiers re-acquires
         // the same mutex itself; under the previous structure this happened to
         // work because Costmap2D::mutex_t is a std::recursive_mutex, but
         // load-bearing recursion that isn't documented locally is a footgun.
-        // Scope the lock to the fill, then call explore() unlocked.
+        // Scope the lock to the mutation, then call explore() unlocked.
         {
             std::lock_guard<Costmap2D::mutex_t> lock(*costmap_.getMutex());
+            costmap_.resizeMap(size_in_cells_x,
+                               size_in_cells_y,
+                               resolution,
+                               origin_x,
+                               origin_y);
             unsigned char *costmap_data = costmap_.getCharMap();
             size_t costmap_size = costmap_.getSizeInCellsX() * costmap_.getSizeInCellsY();
             RCLCPP_DEBUG(get_logger(), "full map update, %lu values", costmap_size);
+            if (occupancyGrid->data.size() != costmap_size) {
+                // A publisher whose data array disagrees with width*height is
+                // corrupt/inconsistent; fill the overlap but say so loudly.
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                    "OccupancyGrid data size %zu does not match %ux%u = %zu cells — "
+                    "filling only the overlapping prefix.",
+                    occupancyGrid->data.size(), size_in_cells_x, size_in_cells_y,
+                    costmap_size);
+            }
             for (size_t i = 0; i < costmap_size && i < occupancyGrid->data.size(); ++i) {
                 auto cell_cost = static_cast<unsigned char>(occupancyGrid->data[i]);
                 costmap_data[i] = costTranslationTable_[cell_cost];
