@@ -73,13 +73,18 @@ inline std::array<unsigned char, 256> init_translation_table()
   return cost_translation_table;
 }
 
-/// A cell is traversable if it is not lethal and not unknown — this includes
-/// kFreeSpace (0) and inflated cells (1-252). Using kFreeSpace alone misses
-/// narrow passages where inflation zones from both walls overlap, leaving no
-/// cost-0 cells even though the robot can physically fit.
+/// A cell is traversable if its cost is at most kMaxAcceptableCost — this
+/// includes kFreeSpace (0) and inflated cells (1-252). Using kFreeSpace
+/// alone would miss narrow passages where inflation zones from both walls
+/// overlap, leaving no cost-0 cells even though the robot can physically
+/// fit. kInscribedInflatedObstacle (253) is rejected along with
+/// kLethalObstacle (254) and kNoInformation (255): the robot center cannot
+/// occupy an inscribed-obstacle cell, so counting it as traversable let the
+/// reachability BFS expand through cells the robot can't actually pass and
+/// overcounted "free" neighbors when qualifying frontier cells.
 inline constexpr bool is_traversable(unsigned char cost)
 {
-  return cost != kNoInformation && cost != kLethalObstacle;
+  return cost <= kMaxAcceptableCost;
 }
 
 /// Yaw (rotation about +Z, radians in (-pi, pi]) of a unit quaternion.

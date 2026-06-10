@@ -66,13 +66,25 @@ TEST(Traversability, AcceptsFreeAndInflatedCells)
   EXPECT_TRUE(auto_mapper::is_traversable(auto_mapper::kMaxAcceptableCost));
 }
 
-TEST(Traversability, RejectsLethalAndUnknownCells)
+TEST(Traversability, RejectsInscribedLethalAndUnknownCells)
 {
+  // kInscribedInflatedObstacle is a cell the robot center cannot occupy;
+  // treating it as traversable let the reachability BFS pass through
+  // near-certain obstacles (occupancy 99 maps to 253).
+  EXPECT_FALSE(auto_mapper::is_traversable(auto_mapper::kInscribedInflatedObstacle));
   EXPECT_FALSE(auto_mapper::is_traversable(auto_mapper::kLethalObstacle));
   EXPECT_FALSE(auto_mapper::is_traversable(auto_mapper::kNoInformation));
-  // Note: kInscribedInflatedObstacle (253) currently counts as traversable
-  // even though the robot center cannot occupy such a cell. Tracked as an
-  // open design question; intentionally not asserted either way here.
+}
+
+TEST(Traversability, MatchesGoalAcceptanceThreshold)
+{
+  // Traversability and goal validation share kMaxAcceptableCost, so a cell
+  // the BFS walks through is always also a legal goal cell and vice versa.
+  for (int cost = 0; cost <= 255; ++cost) {
+    EXPECT_EQ(
+      auto_mapper::is_traversable(static_cast<unsigned char>(cost)),
+      cost <= auto_mapper::kMaxAcceptableCost) << "cost " << cost;
+  }
 }
 
 TEST(YawFromQuaternion, RecoversYawFromUnitQuaternions)

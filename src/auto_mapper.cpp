@@ -717,9 +717,10 @@ private:
         return out;
     }
 
-    /// A cell is traversable if it is not lethal and not unknown — this includes
-    /// FREE_SPACE (0) and inflated cells (1-252). Rationale and unit tests live
-    /// with auto_mapper::is_traversable in exploration_logic.hpp.
+    /// A cell is traversable if its cost is at most MAX_ACCEPTABLE_COST_ —
+    /// free and inflated cells, but not inscribed/lethal/unknown. Rationale
+    /// and unit tests live with auto_mapper::is_traversable in
+    /// exploration_logic.hpp.
     static bool isTraversable(unsigned char cost) {
         return auto_mapper::is_traversable(cost);
     }
