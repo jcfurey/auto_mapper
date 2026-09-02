@@ -93,6 +93,31 @@ inline double yaw_from_quaternion(double x, double y, double z, double w)
   return std::atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z));
 }
 
+/// Choose a frontier goal heading that looks from the refined free-space goal
+/// into the unknown frontier. If refinement did not displace the centroid,
+/// use the approach bearing; if every point coincides, retain the robot yaw.
+inline double frontier_goal_yaw(
+  double goal_x, double goal_y,
+  double centroid_x, double centroid_y,
+  double robot_x, double robot_y,
+  double robot_yaw)
+{
+  constexpr double kDirectionEpsilonSquared = 1e-12;
+  double dx = centroid_x - goal_x;
+  double dy = centroid_y - goal_y;
+  if (dx * dx + dy * dy > kDirectionEpsilonSquared) {
+    return std::atan2(dy, dx);
+  }
+
+  dx = centroid_x - robot_x;
+  dy = centroid_y - robot_y;
+  if (dx * dx + dy * dy > kDirectionEpsilonSquared) {
+    return std::atan2(dy, dx);
+  }
+
+  return robot_yaw;
+}
+
 /// Weights for frontier scoring; defaults match the node's ROS parameter
 /// defaults (frontier_size_weight, frontier_distance_weight,
 /// frontier_distance_cap_m, forward_weight).
@@ -111,11 +136,10 @@ struct FrontierScoreParams
 /// \param dx, dy world-frame vector from the robot to the frontier centroid
 /// \param yaw robot heading, radians
 ///
-/// Distance acts as a *bonus* (clamped to distance_cap_m), not a penalty,
-/// and the forward term rewards frontiers in the robot's heading direction:
-/// together they produce depth-first behavior in tunnels — continue forward
-/// before turning around to explore side branches. The forward term is
-/// suppressed within 0.5 m, where heading alignment is mostly noise.
+/// Distance is clamped before weighting and applied as a travel penalty. The
+/// bounded forward term only rewards frontiers in the robot's forward half
+/// plane, so a remote sideways target cannot dominate nearby work. The
+/// forward term is suppressed within 0.5 m, where heading alignment is noise.
 inline double score_frontier(
   const FrontierScoreParams & params,
   double frontier_length_m, double dx, double dy, double yaw)
@@ -125,16 +149,15 @@ inline double score_frontier(
 
   double forward_bonus = 0.0;
   if (params.forward_weight > 0.0 && distance > 0.5) {
-    // dot in [-1, 1]: +1 = directly ahead, -1 = directly behind;
-    // mapped to [0, 1] so behind = 0, ahead = 1, side = 0.5.
+    // dot in [-1, 1]: +1 = directly ahead, 0 = sideways, -1 = behind.
+    // Clamp at zero so only the forward half-plane receives a bonus.
     const double dot =
       (dx * std::cos(yaw) + dy * std::sin(yaw)) / distance;
-    const double forward_factor = (dot + 1.0) / 2.0;
-    forward_bonus = params.forward_weight * forward_factor * clamped_distance;
+    forward_bonus = params.forward_weight * std::max(0.0, dot);
   }
 
   return params.size_weight * frontier_length_m +
-         params.distance_weight * clamped_distance +
+         -params.distance_weight * clamped_distance +
          forward_bonus;
 }
 

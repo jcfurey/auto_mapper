@@ -39,9 +39,9 @@ with substantial divergence — see **Differences from upstream** below.
 | `min_distance_to_frontier_m` | `0.75` | Skip frontiers closer than this. |
 | `max_distance_to_frontier_m` | `40.0` | Skip frontiers farther than this. |
 | `frontier_size_weight` | `1.0` | Score multiplier for frontier length. |
-| `frontier_distance_weight` | `0.35` | Score multiplier for clamped distance (further = more attractive, up to cap). |
+| `frontier_distance_weight` | `0.35` | Travel penalty for clamped distance (nearer frontiers score higher). |
 | `frontier_distance_cap_m` | `20.0` | Distance is clamped to this before scoring. |
-| `forward_weight` | `2.0` | Bonus for frontiers in the robot's heading direction (depth-first in tunnels). 0 disables. |
+| `forward_weight` | `2.0` | Bounded bonus for frontiers in the robot's forward half-plane. 0 disables. |
 | `min_free_threshold` | `4` | Number of traversable 8-neighbors required for a cell to count as a frontier. |
 | `goal_clearance_radius_m` | `1.5` | Search this radius around the centroid for the lowest-cost cell to use as the goal. 0 disables. |
 | `blacklist_radius_m` | `1.0` | Re-reject frontiers whose centroid is within this radius of a recently rejected goal. |
@@ -54,11 +54,13 @@ with substantial divergence — see **Differences from upstream** below.
   was PoseStamped only.
 - Bundled `nav2`/`slam_toolbox` launch glue removed — this package
   ships only the node, and is launched from a parent workspace.
-- Frontier scoring is parameterized (size, distance, forward-bias)
-  instead of nearest-frontier.
+- Frontier scoring balances information gain against travel distance, with a
+  bounded forward bias instead of unbounded cross-map attraction.
 - Goal-clearance refinement: shifts the dispatched goal to the lowest
   cost cell within a radius of the centroid (pulls goals away from
   walls).
+- Frontier-facing goal headings replace a fixed map-frame yaw, avoiding
+  unnecessary arrival rotations while aiming the sensor into unknown space.
 - BFS expands through inflated cells, not only `FREE_SPACE`, so
   corridors narrower than 2× inflation_radius are reachable.
 - Seed-cell BFS recovery for cases where the robot's vicinity is

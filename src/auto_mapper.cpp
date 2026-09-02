@@ -634,7 +634,17 @@ private:
         drawMarkers(frontiers);
         auto goal = NavigateToPose::Goal();
         goal.pose.pose.position = goal_point;
-        goal.pose.pose.orientation.w = 1.;
+        // Finish facing through the selected free-space goal toward the
+        // unknown frontier. The former hardcoded map yaw of zero caused a
+        // needless full rotation at most arrivals, compounding wheel-odometry
+        // error and observing less of the space that motivated the goal.
+        const double goal_yaw = auto_mapper::frontier_goal_yaw(
+            goal_point.x, goal_point.y,
+            frontier.centroid.x, frontier.centroid.y,
+            robot_position.x, robot_position.y,
+            robotYaw());
+        goal.pose.pose.orientation.z = std::sin(goal_yaw / 2.0);
+        goal.pose.pose.orientation.w = std::cos(goal_yaw / 2.0);
         // Use the costmap's frame_id, not a hardcoded "map" — the marker fix
         // (commit e0b1ef9) caught this for visualization but missed the actual
         // goal. If the costmap publishes in any other frame (multi-robot
@@ -642,8 +652,10 @@ private:
         goal.pose.header.frame_id = mapFrameId_;
         goal.pose.header.stamp = now();
 
-        RCLCPP_INFO(get_logger(), "Sending goal %.2f,%.2f (centroid was %.2f,%.2f)",
-            goal_point.x, goal_point.y, frontier.centroid.x, frontier.centroid.y);
+        RCLCPP_INFO(get_logger(),
+            "Sending goal %.2f,%.2f yaw %.2f (centroid was %.2f,%.2f)",
+            goal_point.x, goal_point.y, goal_yaw,
+            frontier.centroid.x, frontier.centroid.y);
 
         // Set exploring flag synchronously BEFORE async_send_goal to prevent
         // updateFullMap() from calling explore() again before the response arrives.

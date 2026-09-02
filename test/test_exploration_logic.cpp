@@ -98,6 +98,29 @@ TEST(YawFromQuaternion, RecoversYawFromUnitQuaternions)
   EXPECT_NEAR(auto_mapper::yaw_from_quaternion(0.0, 0.0, 1.0, 0.0), kPi, 1e-12);
 }
 
+TEST(FrontierGoalYaw, FacesFromRefinedGoalIntoUnknownSpace)
+{
+  EXPECT_NEAR(
+    auto_mapper::frontier_goal_yaw(0.0, 0.0, 1.0, 0.0, -1.0, 0.0, 0.4),
+    0.0, 1e-12);
+  EXPECT_NEAR(
+    auto_mapper::frontier_goal_yaw(0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.4),
+    kPi / 2.0, 1e-12);
+  EXPECT_NEAR(
+    auto_mapper::frontier_goal_yaw(0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 0.4),
+    kPi, 1e-12);
+}
+
+TEST(FrontierGoalYaw, FallsBackToApproachBearingThenRobotYaw)
+{
+  EXPECT_NEAR(
+    auto_mapper::frontier_goal_yaw(2.0, 2.0, 2.0, 2.0, 2.0, 0.0, -0.3),
+    kPi / 2.0, 1e-12);
+  EXPECT_DOUBLE_EQ(
+    auto_mapper::frontier_goal_yaw(2.0, 2.0, 2.0, 2.0, 2.0, 2.0, -0.3),
+    -0.3);
+}
+
 TEST(ScoreFrontier, ReducesToSizeTermWhenOtherWeightsAreZero)
 {
   FrontierScoreParams params;
@@ -108,16 +131,15 @@ TEST(ScoreFrontier, ReducesToSizeTermWhenOtherWeightsAreZero)
   EXPECT_DOUBLE_EQ(score, 6.0);
 }
 
-TEST(ScoreFrontier, DistanceActsAsBonusUpToCap)
+TEST(ScoreFrontier, DistanceActsAsPenaltyUpToCap)
 {
-  // Documents the intentional sign convention: with the default positive
-  // distance_weight, farther frontiers score higher (depth-first behavior),
-  // saturating at distance_cap_m.
+  // With the default positive distance_weight, nearby work scores higher;
+  // the penalty saturates at distance_cap_m.
   FrontierScoreParams params;
   params.forward_weight = 0.0;  // isolate the distance term
   const double near = auto_mapper::score_frontier(params, 1.0, 2.0, 0.0, 0.0);
   const double far = auto_mapper::score_frontier(params, 1.0, 10.0, 0.0, 0.0);
-  EXPECT_GT(far, near);
+  EXPECT_GT(near, far);
 
   const double at_cap =
     auto_mapper::score_frontier(params, 1.0, params.distance_cap_m, 0.0, 0.0);
@@ -134,7 +156,19 @@ TEST(ScoreFrontier, PrefersFrontiersAheadOfTheRobot)
   const double side = auto_mapper::score_frontier(params, 1.0, 5.0, 0.0, yaw);
   const double behind = auto_mapper::score_frontier(params, 1.0, 0.0, -5.0, yaw);
   EXPECT_GT(ahead, side);
-  EXPECT_GT(side, behind);
+  EXPECT_NEAR(side, behind, 1e-12);
+}
+
+TEST(ScoreFrontier, ForwardBonusIsBoundedAndDoesNotGrowWithDistance)
+{
+  FrontierScoreParams params;
+  params.size_weight = 0.0;
+  params.distance_weight = 0.0;
+  params.forward_weight = 2.0;
+  const double near = auto_mapper::score_frontier(params, 1.0, 1.0, 0.0, 0.0);
+  const double far = auto_mapper::score_frontier(params, 1.0, 10.0, 0.0, 0.0);
+  EXPECT_DOUBLE_EQ(near, 2.0);
+  EXPECT_DOUBLE_EQ(far, 2.0);
 }
 
 TEST(ScoreFrontier, SuppressesForwardBonusAtCloseRange)
@@ -153,11 +187,11 @@ TEST(ScoreFrontier, SuppressesForwardBonusAtCloseRange)
 
 TEST(ScoreFrontier, MatchesHandComputedExample)
 {
-  // size 1.0 * 2.0 m + distance 0.35 * 4.0 m + forward 2.0 * 1.0 * 4.0 m
-  // (directly ahead: forward_factor = 1) = 2.0 + 1.4 + 8.0
+  // size 1.0 * 2.0 m - distance 0.35 * 4.0 m + forward 2.0 * 1.0
+  // (directly ahead) = 2.0 - 1.4 + 2.0
   const FrontierScoreParams params;
   const double score = auto_mapper::score_frontier(params, 2.0, 4.0, 0.0, 0.0);
-  EXPECT_NEAR(score, 11.4, 1e-12);
+  EXPECT_NEAR(score, 2.6, 1e-12);
 }
 
 TEST(Blacklist, EmptyListBlocksNothing)
