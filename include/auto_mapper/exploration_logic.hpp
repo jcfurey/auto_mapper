@@ -23,7 +23,6 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <vector>
@@ -53,14 +52,15 @@ static_assert(
 ///
 /// OccupancyGrid values are int8 in [-1, 100]. After a
 /// static_cast<unsigned char>, valid inputs are [0..100] and 255 (= -1,
-/// unknown). Indices 101..254 are unreachable but cheap to fill.
+/// unknown). Invalid indices 101..254 are conservatively mapped to unknown.
 /// [1..98] maps linearly onto [1..252]; 0, 99, 100 and 255 are pinned by
 /// the OccupancyGrid -> costmap convention.
 inline std::array<unsigned char, 256> init_translation_table()
 {
   std::array<unsigned char, 256> cost_translation_table{};
+  cost_translation_table.fill(kNoInformation);
 
-  for (std::size_t i = 1; i < 256; ++i) {
+  for (std::size_t i = 1; i <= 98; ++i) {
     cost_translation_table[i] =
       static_cast<unsigned char>(1 + (251 * (i - 1)) / 97);
   }
@@ -94,23 +94,23 @@ inline double yaw_from_quaternion(double x, double y, double z, double w)
 }
 
 /// Choose a frontier goal heading that looks from the refined free-space goal
-/// into the unknown frontier. If refinement did not displace the centroid,
+/// into the unknown boundary. If the goal coincides with the boundary point,
 /// use the approach bearing; if every point coincides, retain the robot yaw.
 inline double frontier_goal_yaw(
   double goal_x, double goal_y,
-  double centroid_x, double centroid_y,
+  double boundary_x, double boundary_y,
   double robot_x, double robot_y,
   double robot_yaw)
 {
   constexpr double kDirectionEpsilonSquared = 1e-12;
-  double dx = centroid_x - goal_x;
-  double dy = centroid_y - goal_y;
+  double dx = boundary_x - goal_x;
+  double dy = boundary_y - goal_y;
   if (dx * dx + dy * dy > kDirectionEpsilonSquared) {
     return std::atan2(dy, dx);
   }
 
-  dx = centroid_x - robot_x;
-  dy = centroid_y - robot_y;
+  dx = boundary_x - robot_x;
+  dy = boundary_y - robot_y;
   if (dx * dx + dy * dy > kDirectionEpsilonSquared) {
     return std::atan2(dy, dx);
   }
@@ -133,7 +133,7 @@ struct FrontierScoreParams
 ///
 /// \param params scoring weights
 /// \param frontier_length_m frontier size in meters
-/// \param dx, dy world-frame vector from the robot to the frontier centroid
+/// \param dx, dy world-frame vector from the robot to the frontier approach goal
 /// \param yaw robot heading, radians
 ///
 /// Distance is clamped before weighting and applied as a travel penalty. The
@@ -161,7 +161,7 @@ inline double score_frontier(
          forward_bonus;
 }
 
-/// Rejected goal locations are remembered so the same frontier centroid is
+/// Rejected goal locations are remembered so the same boundary point is
 /// not re-selected on the next map update. Entries expire after a
 /// configurable duration so that previously inaccessible areas can be
 /// retried once the map has changed.
@@ -169,7 +169,8 @@ struct BlacklistEntry
 {
   double x;
   double y;
-  std::chrono::steady_clock::time_point when;
+  // Seconds on the caller's mission clock (ROS time in the node).
+  double when;
 };
 
 /// True if (x, y) lies strictly within radius_m of any blacklist entry.
@@ -186,40 +187,32 @@ inline bool is_blacklisted(
     });
 }
 
-/// Blacklist a rejected/aborted goal together with the frontier centroid it
-/// was refined from.
-///
-/// Goal refinement can displace the dispatched goal by up to
-/// goal_clearance_radius_m from the centroid, which by default exceeds
-/// blacklist_radius_m. Blacklisting only the refined goal point then fails
-/// to cover the centroid: the same frontier survives the blacklist filter
-/// on the next map update, refines to the same rejected goal, and is
-/// rejected again — a livelock until the map happens to change. Recording
-/// both points closes that gap.
+/// Blacklist a rejected/aborted goal together with its actual boundary point.
+/// Refinement can move the goal beyond the boundary's blacklist radius.
+/// Recording both points prevents immediately reselecting the same approach.
 inline void blacklist_rejected_goal(
   std::vector<BlacklistEntry> & entries,
   double goal_x, double goal_y,
-  double centroid_x, double centroid_y,
-  std::chrono::steady_clock::time_point now)
+  double boundary_x, double boundary_y,
+  double now)
 {
   entries.push_back({goal_x, goal_y, now});
-  if (goal_x != centroid_x || goal_y != centroid_y) {
-    entries.push_back({centroid_x, centroid_y, now});
+  if (goal_x != boundary_x || goal_y != boundary_y) {
+    entries.push_back({boundary_x, boundary_y, now});
   }
 }
 
-/// Drop entries older than duration_sec (measured against `now`).
+/// Drop expired entries and entries from before a backward mission-clock jump.
 inline void prune_blacklist(
   std::vector<BlacklistEntry> & entries,
-  std::chrono::steady_clock::time_point now, double duration_sec)
+  double now, double duration_sec)
 {
-  const auto duration =
-    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-    std::chrono::duration<double>(duration_sec));
   entries.erase(
     std::remove_if(
       entries.begin(), entries.end(),
-      [now, duration](const BlacklistEntry & e) {return (now - e.when) > duration;}),
+      [now, duration_sec](const BlacklistEntry & e) {
+        return now < e.when || now - e.when > duration_sec;
+      }),
     entries.end());
 }
 

@@ -14,7 +14,6 @@
 
 #include <gtest/gtest.h>
 
-#include <chrono>
 #include <cmath>
 #include <vector>
 
@@ -25,7 +24,6 @@ namespace
 
 using auto_mapper::BlacklistEntry;
 using auto_mapper::FrontierScoreParams;
-using std::chrono::steady_clock;
 
 constexpr double kPi = 3.14159265358979323846;
 
@@ -37,6 +35,14 @@ TEST(TranslationTable, PinsSpecialOccupancyValues)
   EXPECT_EQ(table[100], auto_mapper::kLethalObstacle);
   // OccupancyGrid's -1 (unknown) arrives as 255 after the unsigned cast.
   EXPECT_EQ(table[255], auto_mapper::kNoInformation);
+}
+
+TEST(TranslationTable, InvalidOccupancyNeverBecomesTraversable)
+{
+  const auto table = auto_mapper::init_translation_table();
+  for (int i = 101; i < 255; ++i) {
+    EXPECT_EQ(table[i], auto_mapper::kNoInformation);
+  }
 }
 
 TEST(TranslationTable, MapsOccupancyLinearlyOntoCostRange)
@@ -202,7 +208,7 @@ TEST(Blacklist, EmptyListBlocksNothing)
 
 TEST(Blacklist, BlocksStrictlyWithinRadius)
 {
-  const auto now = steady_clock::now();
+  const auto now = 1000.0;
   const std::vector<BlacklistEntry> entries = {{10.0, -5.0, now}};
   EXPECT_TRUE(auto_mapper::is_blacklisted(entries, 10.0, -5.0, 1.0));
   EXPECT_TRUE(auto_mapper::is_blacklisted(entries, 10.5, -5.0, 1.0));
@@ -213,7 +219,7 @@ TEST(Blacklist, BlocksStrictlyWithinRadius)
 
 TEST(Blacklist, ChecksEveryEntry)
 {
-  const auto now = steady_clock::now();
+  const auto now = 1000.0;
   const std::vector<BlacklistEntry> entries = {{0.0, 0.0, now}, {5.0, 5.0, now}};
   EXPECT_TRUE(auto_mapper::is_blacklisted(entries, 5.2, 5.2, 1.0));
   EXPECT_FALSE(auto_mapper::is_blacklisted(entries, 2.5, 2.5, 1.0));
@@ -221,10 +227,10 @@ TEST(Blacklist, ChecksEveryEntry)
 
 TEST(Blacklist, PruneDropsOnlyExpiredEntries)
 {
-  const auto now = steady_clock::now();
+  const auto now = 1000.0;
   std::vector<BlacklistEntry> entries = {
-    {1.0, 1.0, now - std::chrono::seconds(120)},  // expired
-    {2.0, 2.0, now - std::chrono::seconds(30)},   // fresh
+    {1.0, 1.0, now - 120.0},  // expired
+    {2.0, 2.0, now - 30.0},   // fresh
     {3.0, 3.0, now},                              // fresh
   };
   auto_mapper::prune_blacklist(entries, now, 60.0);
@@ -246,7 +252,7 @@ TEST(Blacklist, RejectedGoalBlocksBothGoalAndCentroid)
 
   std::vector<BlacklistEntry> entries;
   auto_mapper::blacklist_rejected_goal(
-    entries, goal_x, goal_y, centroid_x, centroid_y, steady_clock::now());
+    entries, goal_x, goal_y, centroid_x, centroid_y, 1000.0);
 
   EXPECT_TRUE(
     auto_mapper::is_blacklisted(entries, goal_x, goal_y, kBlacklistRadius));
@@ -259,16 +265,24 @@ TEST(Blacklist, RejectedGoalDedupesUndisplacedCentroid)
   // When refinement did not move the goal, one entry is enough.
   std::vector<BlacklistEntry> entries;
   auto_mapper::blacklist_rejected_goal(
-    entries, 2.0, 3.0, 2.0, 3.0, steady_clock::now());
+    entries, 2.0, 3.0, 2.0, 3.0, 1000.0);
   EXPECT_EQ(entries.size(), 1u);
+}
+
+TEST(Blacklist, BackwardClockJumpDropsFutureEntries)
+{
+  std::vector<BlacklistEntry> entries = {{1.0, 1.0, 100.0}, {2.0, 2.0, 80.0}};
+  auto_mapper::prune_blacklist(entries, 90.0, 60.0);
+  ASSERT_EQ(entries.size(), 1u);
+  EXPECT_DOUBLE_EQ(entries[0].when, 80.0);
 }
 
 TEST(Blacklist, PruneKeepsEntryExactlyAtExpiry)
 {
   // (now - when) > duration is strict, so an entry exactly at the boundary
   // survives this prune and is dropped on the next one.
-  const auto now = steady_clock::now();
-  std::vector<BlacklistEntry> entries = {{1.0, 1.0, now - std::chrono::seconds(60)}};
+  const auto now = 1000.0;
+  std::vector<BlacklistEntry> entries = {{1.0, 1.0, now - 60.0}};
   auto_mapper::prune_blacklist(entries, now, 60.0);
   EXPECT_EQ(entries.size(), 1u);
 }

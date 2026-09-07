@@ -15,981 +15,898 @@
 // Derived from auto_mapper by Omar Salem (Apache-2.0),
 // https://github.com/Omar-Salem/auto_mapper
 
+#include "auto_mapper/auto_mapper.hpp"
+
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
-#include <functional>
-#include <memory>
-#include <queue>
-#include <string>
-#include <array>
-#include <algorithm>
+#include <cstdint>
 #include <limits>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
-#include "rclcpp_action/rclcpp_action.hpp"
-#include "rclcpp/rclcpp.hpp"
+#include "action_msgs/msg/goal_status.hpp"
+#include "auto_mapper/search_worker.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
-#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
-#include "geometry_msgs/msg/point.hpp"
+#include "nav2_costmap_2d/cost_values.hpp"
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "nav2_msgs/srv/save_map.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/odometry.hpp"
-#include "nav2_costmap_2d/costmap_2d.hpp"
-#include "nav2_costmap_2d/cost_values.hpp"
-#include "visualization_msgs/msg/marker_array.hpp"
-#include "visualization_msgs/msg/marker.hpp"
-#include "std_msgs/msg/color_rgba.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
+#include "rcl_interfaces/msg/parameter_descriptor.hpp"
 #include "std_srvs/srv/set_bool.hpp"
-
-#include "auto_mapper/exploration_logic.hpp"
-
-// exploration_logic.hpp is ROS-free so it can be unit-tested without a ROS 2
-// installation; keep its mirrored cost constants in lock-step with nav2.
-static_assert(auto_mapper::kFreeSpace == nav2_costmap_2d::FREE_SPACE);
-static_assert(
-    auto_mapper::kInscribedInflatedObstacle == nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE);
-static_assert(auto_mapper::kLethalObstacle == nav2_costmap_2d::LETHAL_OBSTACLE);
-static_assert(auto_mapper::kNoInformation == nav2_costmap_2d::NO_INFORMATION);
-
-using std::placeholders::_1;
-using geometry_msgs::msg::PoseWithCovarianceStamped;
-using geometry_msgs::msg::PoseStamped;
-using geometry_msgs::msg::Point;
-using nav_msgs::msg::Odometry;
-using nav_msgs::msg::OccupancyGrid;
-using nav2_msgs::action::NavigateToPose;
-using visualization_msgs::msg::MarkerArray;
-using visualization_msgs::msg::Marker;
-using std_msgs::msg::ColorRGBA;
-using nav2_costmap_2d::Costmap2D;
-using nav2_costmap_2d::NO_INFORMATION;
-using std::chrono::steady_clock;
-using std::chrono_literals::operator""s;
-
-using GoalHandleNavigateToPose = rclcpp_action::ClientGoalHandle<NavigateToPose>;
-
-class AutoMapper : public rclcpp::Node {
-public:
-    AutoMapper()
-            : rclcpp::Node("auto_mapper") {
-        RCLCPP_INFO(get_logger(), "AutoMapper started...");
-
-        // Declare and read parameters in one pass — declare_parameter<T>(name, default)
-        // returns the resolved value, so we don't need a separate get_parameter call
-        // (and we don't need redundant field initializers either).
-        mapTopic_ = declare_parameter<std::string>("map_topic", "/map");
-        odomTopic_ = declare_parameter<std::string>("odom_topic", "/localization/odometry/odom");
-        // pose_topic: optional PoseStamped alternative to odom_topic
-        poseTopic_ = declare_parameter<std::string>("pose_topic", "");
-        mapPath_ = declare_parameter<std::string>("map_path", "/tmp/maps");
-        min_frontier_length_m_ = declare_parameter<double>("min_frontier_length_m", 0.25);
-        min_distance_to_frontier_m_ = declare_parameter<double>("min_distance_to_frontier_m", 0.75);
-        max_distance_to_frontier_m_ = declare_parameter<double>("max_distance_to_frontier_m", 40.0);
-        scoreParams_.size_weight = declare_parameter<double>("frontier_size_weight", 1.0);
-        scoreParams_.distance_weight = declare_parameter<double>("frontier_distance_weight", 0.35);
-        scoreParams_.distance_cap_m = declare_parameter<double>("frontier_distance_cap_m", 20.0);
-        scoreParams_.forward_weight = declare_parameter<double>("forward_weight", 2.0);
-        min_free_threshold_ = declare_parameter<int>("min_free_threshold", 4);
-        goal_clearance_radius_m_ = declare_parameter<double>("goal_clearance_radius_m", 1.5);
-        blacklist_radius_m_ = declare_parameter<double>("blacklist_radius_m", 1.0);
-        blacklist_duration_sec_ = declare_parameter<double>("blacklist_duration_sec", 60.0);
-        goal_timeout_sec_ = declare_parameter<double>("goal_timeout_sec", 300.0);
-
-        const double startup_delay_sec = declare_parameter<double>("startup_delay_sec", 0.0);
-        if (startup_delay_sec > 0.0) {
-            next_explore_time_ = steady_clock::now() +
-                std::chrono::duration_cast<steady_clock::duration>(
-                    std::chrono::duration<double>(startup_delay_sec));
-            RCLCPP_INFO(get_logger(), "Startup delay: %.1f seconds before first exploration.",
-                startup_delay_sec);
-        }
-
-        // Subscribe to Odometry if odom_topic is non-empty (primary source)
-        if (!odomTopic_.empty()) {
-            odomSubscription_ = create_subscription<Odometry>(
-                    odomTopic_, 10, std::bind(&AutoMapper::odomCallback, this, _1));
-            RCLCPP_INFO(get_logger(), "Subscribing to Odometry on '%s'.", odomTopic_.c_str());
-        }
-        // Subscribe to PoseStamped if pose_topic is non-empty (alternative source)
-        if (!poseTopic_.empty()) {
-            poseSubscription_ = create_subscription<PoseStamped>(
-                    poseTopic_, 10, std::bind(&AutoMapper::poseCallback, this, _1));
-            RCLCPP_INFO(get_logger(), "Subscribing to PoseStamped on '%s'.", poseTopic_.c_str());
-        }
-        if (odomTopic_.empty() && poseTopic_.empty()) {
-            RCLCPP_ERROR(get_logger(),
-                "Neither odom_topic nor pose_topic is set — no pose source!");
-        }
-
-        mapSubscription_ = create_subscription<OccupancyGrid>(
-                mapTopic_, 10, std::bind(&AutoMapper::updateFullMap, this, _1));
-
-        markerArrayPublisher_ = create_publisher<MarkerArray>("/frontiers", 10);
-        poseNavigator_ = rclcpp_action::create_client<NavigateToPose>(
-                this,
-                "/navigate_to_pose");
-        // Create the map_saver client once and reuse. The previous code
-        // allocated a fresh client (and blocked the executor for up to 1 s in
-        // wait_for_service) on every result_callback — i.e. every Nav2 goal
-        // completion. Clients destroyed mid-flight also silently drop their
-        // responses.
-        mapSaverClient_ = create_client<nav2_msgs::srv::SaveMap>("/map_server/save_map");
-
-        enabled_ = declare_parameter<bool>("start_enabled", true);
-        RCLCPP_INFO(get_logger(), "Exploration %s at startup.",
-            enabled_ ? "enabled" : "disabled");
-
-        setEnabledService_ = create_service<std_srvs::srv::SetBool>(
-            "~/set_enabled",
-            std::bind(&AutoMapper::setEnabledCallback, this,
-                std::placeholders::_1, std::placeholders::_2));
-
-        // Watchdog for goals whose result never arrives (e.g. the Nav2
-        // action server crashed mid-goal): without it isExploring_ stays
-        // latched true and exploration is wedged until the node restarts.
-        if (goal_timeout_sec_ > 0.0) {
-            watchdogTimer_ = create_wall_timer(
-                5s, std::bind(&AutoMapper::checkGoalWatchdog, this));
-        }
-
-        // Wait for the navigate_to_pose action server, but yield to the executor
-        // so the node can be interrupted (e.g. Ctrl-C) while waiting.
-        while (!poseNavigator_->wait_for_action_server(1s)) {
-            if (!rclcpp::ok()) {
-                RCLCPP_ERROR(get_logger(),
-                    "Interrupted while waiting for navigate_to_pose action server.");
-                return;
-            }
-            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-                "Waiting for navigate_to_pose action server...");
-        }
-        RCLCPP_INFO(get_logger(), "AutoMapper connected to navigate_to_pose action server.");
-    }
-
-private:
-    // Tunables — actual default values live at the declare_parameter<>() call
-    // site in the constructor; these fields are written there before any use.
-    double min_frontier_length_m_;
-    double min_distance_to_frontier_m_;
-    double max_distance_to_frontier_m_;
-    auto_mapper::FrontierScoreParams scoreParams_;
-    int    min_free_threshold_;
-    double goal_clearance_radius_m_;
-    Costmap2D costmap_;
-    rclcpp_action::Client<NavigateToPose>::SharedPtr poseNavigator_;
-    rclcpp::Publisher<MarkerArray>::SharedPtr markerArrayPublisher_;
-    rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr setEnabledService_;
-    rclcpp::Client<nav2_msgs::srv::SaveMap>::SharedPtr mapSaverClient_;
-    bool mapSaverAvailable_ = false;  // latched true after first successful service discovery
-    MarkerArray markersMsg_;
-    rclcpp::Subscription<OccupancyGrid>::SharedPtr mapSubscription_;
-    bool isExploring_ = false;
-    // Goal watchdog: cancel and resume if no result arrives by the deadline.
-    double goal_timeout_sec_;  // ROS param — 0 disables the watchdog
-    steady_clock::time_point goal_deadline_ = steady_clock::time_point::max();
-    rclcpp::TimerBase::SharedPtr watchdogTimer_;
-    // Runtime soft-toggle via ~/set_enabled — written from declare_parameter("start_enabled").
-    bool enabled_;
-    bool exhaustionMapSaved_ = false;  // throttle saveMap() to once per "no frontiers left" episode
-    steady_clock::time_point next_explore_time_ = steady_clock::now();  // backoff after rejection
-    int markerId_ = 0;
-
-    // Blacklist: rejected goal locations are remembered so the same frontier
-    // centroid is not re-selected on the next map update (semantics live in
-    // exploration_logic.hpp; the radius check and expiry are unit-tested there).
-    std::vector<auto_mapper::BlacklistEntry> blacklist_;
-    // ROS param — reject frontiers within this radius of a blacklisted goal.
-    double blacklist_radius_m_;
-    // ROS param — entries expire after this many seconds.
-    double blacklist_duration_sec_;
-    std::string mapPath_;
-    std::string mapTopic_;
-    std::string odomTopic_;
-    std::string poseTopic_;
-
-    rclcpp::Subscription<Odometry>::SharedPtr odomSubscription_;     // odom_topic
-    rclcpp::Subscription<PoseStamped>::SharedPtr poseSubscription_;  // pose_topic
-    PoseWithCovarianceStamped::UniquePtr pose_;
-    bool hasNavigated_ = false;  // true once at least one goal has been accepted
-    // frame_id of the most recent OccupancyGrid; used for marker headers.
-    std::string mapFrameId_ = "map";
-    bool poseFrameMismatchWarned_ = false;  // one-shot guard for the pose/costmap frame WARN
-
-    // Maximum costmap cost we'll accept for a goal cell. Both refinement
-    // (refineGoalClearance) and validation (in explore()) check against
-    // this threshold so a borderline cell can't pass one and fail the other.
-    // See exploration_logic.hpp for the full rationale.
-    static constexpr unsigned char MAX_ACCEPTABLE_COST_ = auto_mapper::kMaxAcceptableCost;
-
-    // OccupancyGrid value → costmap cost. Defined (and unit-tested) in
-    // exploration_logic.hpp.
-    std::array<unsigned char, 256> costTranslationTable_ = auto_mapper::init_translation_table();
-
-    struct Frontier {
-        Point centroid;
-        std::vector<Point> points;
-    };
-
-    double frontierDistance(const Frontier & frontier, const Point & position) const {
-        const double dx = frontier.centroid.x - position.x;
-        const double dy = frontier.centroid.y - position.y;
-        return std::sqrt(dx * dx + dy * dy);
-    }
-
-    bool isBlacklisted(const Point & p) const {
-        return auto_mapper::is_blacklisted(blacklist_, p.x, p.y, blacklist_radius_m_);
-    }
-
-    void pruneBlacklist() {
-        auto_mapper::prune_blacklist(blacklist_, steady_clock::now(), blacklist_duration_sec_);
-    }
-
-    double robotYaw() const {
-        if (!pose_) return 0.0;
-        const auto & q = pose_->pose.pose.orientation;
-        return auto_mapper::yaw_from_quaternion(q.x, q.y, q.z, q.w);
-    }
-
-    double scoreFrontier(const Frontier & frontier, const Point & position) const {
-        const double frontier_length_m = frontier.points.size() * costmap_.getResolution();
-        return auto_mapper::score_frontier(
-            scoreParams_,
-            frontier_length_m,
-            frontier.centroid.x - position.x,
-            frontier.centroid.y - position.y,
-            robotYaw());
-    }
-
-    // Called for nav_msgs/Odometry messages (odom_topic).
-    void odomCallback(Odometry::UniquePtr msg) {
-        if (pose_ == nullptr) {
-            RCLCPP_INFO(get_logger(), "Initial robot pose received on odom_topic '%s'.",
-                odomTopic_.c_str());
-        }
-        pose_ = std::make_unique<PoseWithCovarianceStamped>();
-        pose_->header = msg->header;
-        pose_->pose   = msg->pose;  // PoseWithCovariance — includes covariance
-    }
-
-    // Called for geometry_msgs/PoseStamped messages (pose_topic).
-    void poseCallback(PoseStamped::UniquePtr msg) {
-        if (pose_ == nullptr) {
-            RCLCPP_INFO(get_logger(), "Initial robot pose received on pose_topic '%s'.",
-                poseTopic_.c_str());
-        }
-        pose_ = std::make_unique<PoseWithCovarianceStamped>();
-        pose_->header      = msg->header;
-        pose_->pose.pose   = msg->pose;
-        // Covariance is unavailable from PoseStamped; remains zero-initialized.
-    }
-
-    void updateFullMap(OccupancyGrid::UniquePtr occupancyGrid) {
-        if (pose_ == nullptr) {
-            // Whichever pose source is configured (may be both); print the
-            // non-empty one so operators can see what we're actually waiting
-            // on. Falling back to "<unset>" makes the misconfiguration loud.
-            const std::string pose_source = !odomTopic_.empty() ? odomTopic_
-                                          : !poseTopic_.empty() ? poseTopic_
-                                          : std::string("<unset>");
-            RCLCPP_WARN_THROTTLE(
-                get_logger(),
-                *get_clock(),
-                5000,  // Throttle to every 5 seconds
-                "Map received on topic '%s', but waiting for initial pose on topic '%s' "
-                "to begin exploring.",
-                mapTopic_.c_str(), pose_source.c_str());
-            return;
-        }
-        RCLCPP_DEBUG(get_logger(), "updateFullMap...");
-        mapFrameId_ = occupancyGrid->header.frame_id;
-
-        // We use pose_->pose.pose.position directly against the costmap (no TF
-        // transform), which assumes pose and costmap are in the same frame.
-        // Warn loudly the first time they disagree — typically when an
-        // operator turns on map-frame localization without realising
-        // auto_mapper isn't TF-aware.
-        if (!poseFrameMismatchWarned_ &&
-            !pose_->header.frame_id.empty() &&
-            pose_->header.frame_id != mapFrameId_) {
-            RCLCPP_WARN(get_logger(),
-                "Pose frame '%s' differs from costmap frame '%s' — auto_mapper "
-                "does not TF-transform pose into the map frame. Frontier search "
-                "and goal coordinates will be wrong unless the two frames are "
-                "related by an identity transform.",
-                pose_->header.frame_id.c_str(), mapFrameId_.c_str());
-            poseFrameMismatchWarned_ = true;
-        }
-        const auto occupancyGridInfo = occupancyGrid->info;
-        unsigned int size_in_cells_x = occupancyGridInfo.width;
-        unsigned int size_in_cells_y = occupancyGridInfo.height;
-        double resolution = occupancyGridInfo.resolution;
-        double origin_x = occupancyGridInfo.origin.position.x;
-        double origin_y = occupancyGridInfo.origin.position.y;
-
-        RCLCPP_DEBUG(get_logger(), "received full new map, resizing to: %u, %u", size_in_cells_x,
-                    size_in_cells_y);
-
-        // Hold the costmap mutex for the resize + bulk write, but not for the
-        // findFrontiers BFS that explore() kicks off. findFrontiers re-acquires
-        // the same mutex itself; under the previous structure this happened to
-        // work because Costmap2D::mutex_t is a std::recursive_mutex, but
-        // load-bearing recursion that isn't documented locally is a footgun.
-        // Scope the lock to the mutation, then call explore() unlocked.
-        {
-            std::lock_guard<Costmap2D::mutex_t> lock(*costmap_.getMutex());
-            costmap_.resizeMap(size_in_cells_x,
-                               size_in_cells_y,
-                               resolution,
-                               origin_x,
-                               origin_y);
-            unsigned char *costmap_data = costmap_.getCharMap();
-            size_t costmap_size = costmap_.getSizeInCellsX() * costmap_.getSizeInCellsY();
-            RCLCPP_DEBUG(get_logger(), "full map update, %lu values", costmap_size);
-            if (occupancyGrid->data.size() != costmap_size) {
-                // A publisher whose data array disagrees with width*height is
-                // corrupt/inconsistent; fill the overlap but say so loudly.
-                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
-                    "OccupancyGrid data size %zu does not match %ux%u = %zu cells — "
-                    "filling only the overlapping prefix.",
-                    occupancyGrid->data.size(), size_in_cells_x, size_in_cells_y,
-                    costmap_size);
-            }
-            for (size_t i = 0; i < costmap_size && i < occupancyGrid->data.size(); ++i) {
-                auto cell_cost = static_cast<unsigned char>(occupancyGrid->data[i]);
-                costmap_data[i] = costTranslationTable_[cell_cost];
-            }
-        }
-
-        explore();
-    }
-
-    /// Shift a goal point toward the lowest-cost cell within a search radius.
-    /// In tunnels this pulls centroids away from walls toward the corridor center.
-    /// Strongly prefers FREE_SPACE cells; within a cost tier, picks the cell
-    /// closest to the original centroid.
-    Point refineGoalClearance(const Point & centroid) const {
-        if (goal_clearance_radius_m_ <= 0.0) return centroid;
-
-        unsigned int cx, cy;
-        if (!costmap_.worldToMap(centroid.x, centroid.y, cx, cy)) {
-            return centroid;
-        }
-
-        int radius_cells = static_cast<int>(
-            goal_clearance_radius_m_ / costmap_.getResolution());
-        int sx = static_cast<int>(costmap_.getSizeInCellsX());
-        int sy = static_cast<int>(costmap_.getSizeInCellsY());
-
-        unsigned char best_cost = 255;  // start worse than anything
-        unsigned int best_mx = cx, best_my = cy;
-        double best_dist2 = std::numeric_limits<double>::max();
-
-        for (int dy = -radius_cells; dy <= radius_cells; ++dy) {
-            for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
-                int nx = static_cast<int>(cx) + dx;
-                int ny = static_cast<int>(cy) + dy;
-                if (nx < 0 || nx >= sx || ny < 0 || ny >= sy) continue;
-
-                unsigned char cost = costmap_.getCost(nx, ny);
-                // Skip cells that are too dangerous. NO_INFORMATION (255) is
-                // also above MAX_ACCEPTABLE_COST_ (252), so unknown cells are
-                // rejected here too — no separate check needed.
-                if (cost > MAX_ACCEPTABLE_COST_) continue;
-
-                double dist2 = dx * dx + dy * dy;
-                if (cost < best_cost ||
-                    (cost == best_cost && dist2 < best_dist2)) {
-                    best_cost = cost;
-                    best_mx = static_cast<unsigned int>(nx);
-                    best_my = static_cast<unsigned int>(ny);
-                    best_dist2 = dist2;
-                }
-            }
-        }
-
-        // If no acceptable cell was found, return original centroid
-        // (explore() will catch it in the validation step)
-        if (best_cost > MAX_ACCEPTABLE_COST_) return centroid;
-
-        Point refined;
-        double wx, wy;
-        costmap_.mapToWorld(best_mx, best_my, wx, wy);
-        refined.x = wx;
-        refined.y = wy;
-        refined.z = 0.0;
-        return refined;
-    }
-
-    void drawMarkers(const std::vector<Frontier> &frontiers) {
-        // Send a DELETEALL first so RViz/Trillium drops markers from the previous
-        // frame before we publish the current ones. Without this the local
-        // markersMsg_ would either grow unbounded across calls (visual stale
-        // cruft) or, if cleared, leave RViz holding orphans from earlier ADDs.
-        markersMsg_.markers.clear();
-        Marker delete_all;
-        delete_all.action = Marker::DELETEALL;
-        delete_all.ns = "frontiers";
-        markersMsg_.markers.push_back(delete_all);
-
-        ColorRGBA green;
-        green.r = 0.0;
-        green.g = 1.0;
-        green.b = 0.0;
-        green.a = 1.0;
-
-        const auto stamp = now();
-        for (const auto &frontier : frontiers) {
-            RCLCPP_DEBUG(get_logger(), "visualising %f,%f ",
-                frontier.centroid.x, frontier.centroid.y);
-            Marker m;
-            m.header.frame_id = mapFrameId_;
-            m.header.stamp = stamp;
-            m.frame_locked = true;
-            m.action = Marker::ADD;
-            m.ns = "frontiers";
-            m.id = ++markerId_;
-            m.type = Marker::SPHERE;
-            m.pose.position = frontier.centroid;
-            m.scale.x = 0.3;
-            m.scale.y = 0.3;
-            m.scale.z = 0.3;
-            m.color = green;
-            markersMsg_.markers.push_back(m);
-        }
-        markerArrayPublisher_->publish(markersMsg_);
-    }
-
-    void clearMarkers() {
-        markersMsg_.markers.clear();
-        Marker delete_all;
-        delete_all.action = Marker::DELETEALL;
-        delete_all.ns = "frontiers";
-        markersMsg_.markers.push_back(delete_all);
-        markerArrayPublisher_->publish(markersMsg_);
-    }
-
-    void setEnabledCallback(
-        const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
-        std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
-        const bool prev = enabled_;
-        enabled_ = request->data;
-        if (enabled_ == prev) {
-            response->success = true;
-            response->message = enabled_ ? "already enabled" : "already disabled";
-            return;
-        }
-        if (!enabled_) {
-            RCLCPP_INFO(get_logger(),
-                "Exploration disabled via service; cancelling any active goal.");
-            poseNavigator_->async_cancel_all_goals();
-            // isExploring_ will be cleared by the CANCELED result_callback.
-            clearMarkers();
-            response->message = "exploration disabled";
-        } else {
-            RCLCPP_INFO(get_logger(), "Exploration enabled via service.");
-            next_explore_time_ = steady_clock::now();
-            // Treat re-arm as a fresh start so the "Exploration starts in N
-            // seconds…" countdown is not suppressed and exhaustionMapSaved_
-            // resets cleanly when the next batch of frontiers shows up.
-            hasNavigated_ = false;
-            exhaustionMapSaved_ = false;
-            response->message = "exploration enabled";
-            // explore() will be triggered by the next OccupancyGrid callback.
-        }
-        response->success = true;
-    }
-
-    // Runs every 5 s. If a dispatched goal produced neither a response nor a
-    // result by goal_deadline_ — the Nav2 server died mid-goal, or navigation
-    // hung — cancel it and let the next map update re-enter explore().
-    // A straggling result_callback after this fires is harmless: it re-clears
-    // isExploring_ and calls explore(), which is idempotent here.
-    void checkGoalWatchdog() {
-        if (!isExploring_ || steady_clock::now() < goal_deadline_) {
-            return;
-        }
-        RCLCPP_WARN(get_logger(),
-            "Goal did not complete within %.0f s (goal_timeout_sec) — "
-            "cancelling and resuming exploration.",
-            goal_timeout_sec_);
-        poseNavigator_->async_cancel_all_goals();
-        clearMarkers();
-        isExploring_ = false;
-        next_explore_time_ = steady_clock::now() + 5s;
-    }
-
-    void explore() {
-        if (isExploring_ || !enabled_) {
-            return;
-        }
-        if (steady_clock::now() < next_explore_time_) {
-            if (!hasNavigated_) {
-                auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
-                    next_explore_time_ - steady_clock::now()).count();
-                if (remaining > 0) {
-                    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-                        "Exploration starts in %ld seconds...", remaining);
-                }
-            }
-            return;
-        }
-
-        pruneBlacklist();
-
-        auto frontiers = findFrontiers();
-
-        // Remove blacklisted frontiers before scoring.
-        frontiers.erase(
-            std::remove_if(frontiers.begin(), frontiers.end(),
-                [this](const Frontier & f) { return isBlacklisted(f.centroid); }),
-            frontiers.end());
-
-        if (frontiers.empty()) {
-            if (!hasNavigated_) {
-                // Map too sparse to find frontiers yet — wait for more scans.
-                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-                    "No frontiers found yet — waiting for map to populate...");
-                return;
-            }
-            if (!blacklist_.empty()) {
-                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
-                    "All frontiers blacklisted (%zu entries) — waiting for blacklist "
-                    "expiry or new map data...",
-                    blacklist_.size());
-                return;
-            }
-            // No frontiers remain. Don't tear the node down — the map can grow
-            // when the robot rounds a corner an hour later, or when an operator
-            // pushes the rover into a new area; we want to resume automatically.
-            // Save the map once per exhaustion episode so we don't spam the
-            // map_saver with every map update while idle.
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
-                "No frontiers remaining — exploration appears complete. "
-                "Will resume if new frontiers appear in future map updates.");
-            if (!exhaustionMapSaved_) {
-                saveMap();
-                exhaustionMapSaved_ = true;
-            }
-            return;
-        }
-        // We have frontiers again — re-arm the one-shot save.
-        exhaustionMapSaved_ = false;
-        const auto robot_position = pose_->pose.pose.position;
-        const auto frontier_it = std::max_element(
-            frontiers.begin(), frontiers.end(),
-            [this, &robot_position](const Frontier & a, const Frontier & b) {
-                return scoreFrontier(a, robot_position) < scoreFrontier(b, robot_position);
-            });
-        const auto frontier = *frontier_it;
-
-        RCLCPP_INFO(get_logger(),
-            "Selected frontier %.2f, %.2f (size=%.2fm, dist=%.2fm, score=%.2f)",
-            frontier.centroid.x,
-            frontier.centroid.y,
-            frontier.points.size() * costmap_.getResolution(),
-            frontierDistance(frontier, robot_position),
-            scoreFrontier(frontier, robot_position));
-
-        // Refine the goal position: search near the centroid for the cell with
-        // the lowest costmap cost.  In tunnels this pulls goals away from walls
-        // toward the corridor center.
-        Point goal_point = refineGoalClearance(frontier.centroid);
-
-        // Validate that the refined goal is in a traversable cell. Use the same
-        // MAX_ACCEPTABLE_COST_ threshold as refineGoalClearance — if the two
-        // disagree a borderline cell can pass refinement and fail validation
-        // (or vice versa) on the same goal.
-        //
-        // Also reject if the goal is outside the costmap entirely. Previously
-        // this branch silently fell through and dispatched the goal anyway,
-        // which can happen when refineGoalClearance returns the original
-        // centroid because worldToMap failed there too.
-        {
-            unsigned int goal_mx, goal_my;
-            if (!costmap_.worldToMap(goal_point.x, goal_point.y, goal_mx, goal_my)) {
-                RCLCPP_WARN(get_logger(),
-                    "Goal (%.2f, %.2f) is outside the costmap — blacklisting",
-                    goal_point.x, goal_point.y);
-                auto_mapper::blacklist_rejected_goal(
-                    blacklist_, goal_point.x, goal_point.y,
-                    frontier.centroid.x, frontier.centroid.y, steady_clock::now());
-                next_explore_time_ = steady_clock::now() + 1s;
-                return;
-            }
-            const auto cost = costmap_.getCost(goal_mx, goal_my);
-            if (cost > MAX_ACCEPTABLE_COST_) {
-                RCLCPP_WARN(get_logger(),
-                    "Goal (%.2f, %.2f) is inside obstacle (cost=%d) — blacklisting",
-                    goal_point.x, goal_point.y, cost);
-                auto_mapper::blacklist_rejected_goal(
-                    blacklist_, goal_point.x, goal_point.y,
-                    frontier.centroid.x, frontier.centroid.y, steady_clock::now());
-                next_explore_time_ = steady_clock::now() + 1s;
-                return;
-            }
-        }
-
-        drawMarkers(frontiers);
-        auto goal = NavigateToPose::Goal();
-        goal.pose.pose.position = goal_point;
-        // Finish facing through the selected free-space goal toward the
-        // unknown frontier. The former hardcoded map yaw of zero caused a
-        // needless full rotation at most arrivals, compounding wheel-odometry
-        // error and observing less of the space that motivated the goal.
-        const double goal_yaw = auto_mapper::frontier_goal_yaw(
-            goal_point.x, goal_point.y,
-            frontier.centroid.x, frontier.centroid.y,
-            robot_position.x, robot_position.y,
-            robotYaw());
-        goal.pose.pose.orientation.z = std::sin(goal_yaw / 2.0);
-        goal.pose.pose.orientation.w = std::cos(goal_yaw / 2.0);
-        // Use the costmap's frame_id, not a hardcoded "map" — the marker fix
-        // (commit e0b1ef9) caught this for visualization but missed the actual
-        // goal. If the costmap publishes in any other frame (multi-robot
-        // namespace, renamed frames), a hardcoded "map" silently misroutes.
-        goal.pose.header.frame_id = mapFrameId_;
-        goal.pose.header.stamp = now();
-
-        RCLCPP_INFO(get_logger(),
-            "Sending goal %.2f,%.2f yaw %.2f (centroid was %.2f,%.2f)",
-            goal_point.x, goal_point.y, goal_yaw,
-            frontier.centroid.x, frontier.centroid.y);
-
-        // Set exploring flag synchronously BEFORE async_send_goal to prevent
-        // updateFullMap() from calling explore() again before the response arrives.
-        isExploring_ = true;
-        goal_deadline_ = goal_timeout_sec_ > 0.0
-            ? steady_clock::now() + std::chrono::duration_cast<steady_clock::duration>(
-                  std::chrono::duration<double>(goal_timeout_sec_))
-            : steady_clock::time_point::max();
-
-        auto send_goal_options = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
-        send_goal_options.goal_response_callback = [this](
-                const GoalHandleNavigateToPose::SharedPtr &goal_handle) {
-            if (goal_handle) {
-                RCLCPP_INFO(get_logger(), "Goal accepted by server, waiting for result");
-                hasNavigated_ = true;
-            } else {
-                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                    "Goal rejected by server (not yet active?) — retrying in 5s");
-                isExploring_ = false;
-                next_explore_time_ = steady_clock::now() + 5s;
-            }
-        };
-
-        send_goal_options.feedback_callback = [this](
-                const GoalHandleNavigateToPose::SharedPtr &,
-                const std::shared_ptr<const NavigateToPose::Feedback> &feedback) {
-            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-                "Distance remaining: %.2f m", feedback->distance_remaining);
-        };
-
-        // Capture goal and centroid positions for blacklisting on abort —
-        // both points, because refinement can displace the goal farther from
-        // the centroid than blacklist_radius_m_ covers (see
-        // blacklist_rejected_goal in exploration_logic.hpp).
-        const auto goal_x = goal_point.x;
-        const auto goal_y = goal_point.y;
-        const auto centroid_x = frontier.centroid.x;
-        const auto centroid_y = frontier.centroid.y;
-        send_goal_options.result_callback = [this, goal_x, goal_y, centroid_x, centroid_y](
-                const GoalHandleNavigateToPose::WrappedResult &result) {
-            isExploring_ = false;
-            clearMarkers();
-            switch (result.code) {
-                case rclcpp_action::ResultCode::SUCCEEDED:
-                    RCLCPP_INFO(get_logger(), "Goal reached");
-                    // Only snapshot the map on a successful arrival. Saving on
-                    // ABORTED ("we hit a wall") or CANCELED ("operator paused")
-                    // is at best wasteful and at worst captures a degenerate
-                    // robot pose into the persisted map.
-                    saveMap();
-                    break;
-                case rclcpp_action::ResultCode::ABORTED:
-                    RCLCPP_WARN(get_logger(), "Goal (%.2f, %.2f) aborted — blacklisting",
-                        goal_x, goal_y);
-                    auto_mapper::blacklist_rejected_goal(
-                        blacklist_, goal_x, goal_y, centroid_x, centroid_y,
-                        steady_clock::now());
-                    break;
-                case rclcpp_action::ResultCode::CANCELED:
-                    RCLCPP_ERROR(get_logger(), "Goal was canceled");
-                    break;
-                default:
-                    RCLCPP_ERROR(get_logger(), "Unknown result code");
-                    break;
-            }
-            explore();
-        };
-        poseNavigator_->async_send_goal(goal, send_goal_options);
-    }
-
-    void saveMap() {
-        // Non-blocking availability check. service_is_ready() is a polled view
-        // of the discovered server; once it goes true we latch it so we never
-        // pay the discovery cost again. We never call wait_for_service here:
-        // this runs from the result_callback on the single-threaded executor,
-        // and a 1 s block would queue up subsequent goal-completion callbacks.
-        if (!mapSaverAvailable_) {
-            if (!mapSaverClient_->service_is_ready()) {
-                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 30000,
-                    "map_saver service not yet available — skipping map save.");
-                return;
-            }
-            mapSaverAvailable_ = true;
-        }
-        RCLCPP_INFO(get_logger(), "Saving map to %s ...", mapPath_.c_str());
-
-        auto request = std::make_shared<nav2_msgs::srv::SaveMap::Request>();
-        request->map_topic = mapTopic_;
-        request->map_url = mapPath_;
-        request->image_format = "pgm";
-        request->map_mode = "trinary";
-
-        mapSaverClient_->async_send_request(request);
-        RCLCPP_INFO(get_logger(), "Save map request sent for map at %s", mapPath_.c_str());
-    }
-
-    // 8-connected neighbor offsets. static so we don't reconstruct on every
-    // nhood8 call, which used to fire 8–10 M times per map update.
-    static constexpr std::array<std::pair<int, int>, 8> kNhood8Directions_ = {{
-        {-1, -1}, {-1, 1}, {1, -1}, {1, 1},
-        {1, 0}, {-1, 0}, {0, 1}, {0, -1}
-    }};
-
-    // Fixed-size neighbor result. .first = count of valid neighbors written
-    // into the array. Returning by value is fine — std::array of 8 ints is
-    // small and the caller iterates [0, count).
-    struct Neighbors8 {
-        std::array<unsigned int, 8> idx;
-        std::size_t count;
-    };
-
-    Neighbors8 nhood8(unsigned int idx) const {
-        Neighbors8 out{};
-        unsigned int mx, my;
-        costmap_.indexToCells(idx, mx, my);
-        const int x = static_cast<int>(mx);
-        const int y = static_cast<int>(my);
-        const int sx = static_cast<int>(costmap_.getSizeInCellsX());
-        const int sy = static_cast<int>(costmap_.getSizeInCellsY());
-        for (const auto &d : kNhood8Directions_) {
-            const int newX = x + d.first;
-            const int newY = y + d.second;
-            if (newX >= 0 && newX < sx && newY >= 0 && newY < sy) {
-                out.idx[out.count++] = costmap_.getIndex(newX, newY);
-            }
-        }
-        return out;
-    }
-
-    /// A cell is traversable if its cost is at most MAX_ACCEPTABLE_COST_ —
-    /// free and inflated cells, but not inscribed/lethal/unknown. Rationale
-    /// and unit tests live with auto_mapper::is_traversable in
-    /// exploration_logic.hpp.
-    static bool isTraversable(unsigned char cost) {
-        return auto_mapper::is_traversable(cost);
-    }
-
-    bool isAchievableFrontierCell(unsigned int idx,
-                                  const std::vector<bool> &frontier_flag) {
-        auto map = costmap_.getCharMap();
-        // check that cell is unknown and not already marked as frontier
-        if (map[idx] != NO_INFORMATION || frontier_flag[idx]) {
-            return false;
-        }
-
-        // check there's enough traversable space for robot to approach frontier
-        int freeCount = 0;
-        const auto nbrs = nhood8(idx);
-        for (std::size_t i = 0; i < nbrs.count; ++i) {
-            const unsigned int nbr = nbrs.idx[i];
-            if (isTraversable(map[nbr])) {
-                if (++freeCount >= min_free_threshold_) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    Frontier buildNewFrontier(unsigned int neighborCell, std::vector<bool> &frontier_flag) {
-        // Frontier::centroid is geometry_msgs::msg::Point, default-constructed
-        // to (0, 0, 0) by the rosidl-generated ctor. No explicit zero needed.
-        Frontier output;
-
-        std::queue<unsigned int> bfs;
-        bfs.push(neighborCell);
-
-        // Include the seed cell itself. The caller has already set
-        // frontier_flag[neighborCell] = true, but never pushes the cell into
-        // output.points — the BFS loop below only inspects *neighbors* of cells
-        // in the queue. A single-cell frontier (no other achievable-frontier
-        // neighbors) would otherwise leave output.points empty, and the
-        // size-divide at the bottom of this function would NaN out the centroid.
-        {
-            unsigned int seed_mx, seed_my;
-            double seed_wx, seed_wy;
-            costmap_.indexToCells(neighborCell, seed_mx, seed_my);
-            costmap_.mapToWorld(seed_mx, seed_my, seed_wx, seed_wy);
-            Point seed_point;
-            seed_point.x = seed_wx;
-            seed_point.y = seed_wy;
-            output.points.push_back(seed_point);
-            output.centroid.x += seed_wx;
-            output.centroid.y += seed_wy;
-        }
-
-        while (!bfs.empty()) {
-            unsigned int idx = bfs.front();
-            bfs.pop();
-
-            // try adding cells in 8-connected neighborhood to frontier
-            const auto nbrs = nhood8(idx);
-            for (std::size_t i = 0; i < nbrs.count; ++i) {
-                const unsigned int nbr = nbrs.idx[i];
-                // check if neighbour is a potential frontier cell
-                if (isAchievableFrontierCell(nbr, frontier_flag)) {
-                    // mark cell as frontier
-                    frontier_flag[nbr] = true;
-                    unsigned int mx, my;
-                    double wx, wy;
-                    costmap_.indexToCells(nbr, mx, my);
-                    costmap_.mapToWorld(mx, my, wx, wy);
-
-                    Point point;
-                    point.x = wx;
-                    point.y = wy;
-                    output.points.push_back(point);
-
-                    // update centroid of frontier
-                    output.centroid.x += wx;
-                    output.centroid.y += wy;
-
-                    bfs.push(nbr);
-                }
-            }
-        }
-
-        // average out frontier centroid
-        output.centroid.x /= output.points.size();
-        output.centroid.y /= output.points.size();
-        return output;
-    }
-
-    std::vector<Frontier> findFrontiers() {
-        std::vector<Frontier> frontier_list;
-        const auto position = pose_->pose.pose.position;
-        unsigned int mx, my;
-        if (!costmap_.worldToMap(position.x, position.y, mx, my)) {
-            RCLCPP_ERROR(get_logger(), "Robot out of costmap bounds, cannot search for frontiers");
-            return frontier_list;
-        }
-
-        // make sure map is consistent and locked for duration of search
-        std::lock_guard<Costmap2D::mutex_t> lock(*(costmap_.getMutex()));
-
-        auto map_ = costmap_.getCharMap();
-        auto size_x_ = costmap_.getSizeInCellsX();
-        auto size_y_ = costmap_.getSizeInCellsY();
-
-        // initialize flag arrays to keep track of visited and frontier cells
-        std::vector<bool> frontier_flag(size_x_ * size_y_,
-                                   false);
-        std::vector<bool> visited_flag(size_x_ * size_y_,
-                                  false);
-
-        // initialize breadth first search
-        std::queue<unsigned int> bfs;
-
-        unsigned int pos = costmap_.getIndex(mx, my);
-
-        // If the robot's cell is not traversable (common with VDB+patchworkpp since the
-        // robot's immediate vicinity has no lidar rays), search outward for the nearest
-        // traversable cell and seed the BFS from there instead.
-        if (!isTraversable(map_[pos])) {
-            std::queue<unsigned int> seed_bfs;
-            std::vector<bool> seed_visited(size_x_ * size_y_, false);
-            seed_bfs.push(pos);
-            seed_visited[pos] = true;
-            bool found_free = false;
-            // Search up to 200×200 cells for the nearest traversable cell.
-            const unsigned int MAX_SEED_SEARCH = 200 * 200;
-            unsigned int seed_iters = 0;
-            while (!seed_bfs.empty() && seed_iters < MAX_SEED_SEARCH) {
-                unsigned int idx = seed_bfs.front();
-                seed_bfs.pop();
-                ++seed_iters;
-                const auto seed_nbrs = nhood8(idx);
-                for (std::size_t i = 0; i < seed_nbrs.count; ++i) {
-                    const unsigned int nbr = seed_nbrs.idx[i];
-                    if (seed_visited[nbr]) continue;
-                    seed_visited[nbr] = true;
-                    if (isTraversable(map_[nbr])) {
-                        pos = nbr;
-                        found_free = true;
-                        break;
-                    }
-                    if (map_[nbr] == NO_INFORMATION) {
-                        seed_bfs.push(nbr);
-                    }
-                }
-                if (found_free) break;
-            }
-            if (!found_free) {
-                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-                    "Robot vicinity is all unknown/lethal — no traversable cells reachable yet.");
-                return frontier_list;
-            }
-        }
-
-        bfs.push(pos);
-        visited_flag[bfs.front()] = true;
-
-        while (!bfs.empty()) {
-            unsigned int idx = bfs.front();
-            bfs.pop();
-
-            const auto nbrs = nhood8(idx);
-            for (std::size_t i = 0; i < nbrs.count; ++i) {
-                const unsigned int nbr = nbrs.idx[i];
-                // Expand through all traversable cells (free + inflated).
-                // Using FREE_SPACE alone blocks the BFS at inflation boundaries,
-                // making corridors narrower than 2×inflation_radius unreachable.
-                if (isTraversable(map_[nbr]) && !visited_flag[nbr]) {
-                    visited_flag[nbr] = true;
-                    bfs.push(nbr);
-                } else if (isAchievableFrontierCell(nbr, frontier_flag)) {
-                    frontier_flag[nbr] = true;
-                    const Frontier frontier = buildNewFrontier(nbr, frontier_flag);
-
-                    const double distance = frontierDistance(frontier, position);
-                    const double frontier_length_m =
-                        frontier.points.size() * costmap_.getResolution();
-                    if (distance < min_distance_to_frontier_m_) {
-                        continue;
-                    }
-                    if (distance > max_distance_to_frontier_m_) {
-                        continue;
-                    }
-                    if (frontier_length_m < min_frontier_length_m_) {
-                        continue;
-                    }
-                    frontier_list.push_back(frontier);
-                }
-            }
-        }
-
-        return frontier_list;
-    }
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include "tf2_ros/buffer.hpp"
+#include "tf2_ros/transform_listener.hpp"
+#include "visualization_msgs/msg/marker_array.hpp"
+
+namespace auto_mapper
+{
+namespace
+{
+using SteadyClock = std::chrono::steady_clock;
+using Navigate = nav2_msgs::action::NavigateToPose;
+using GoalHandle = rclcpp_action::ClientGoalHandle<Navigate>;
+using Navigator = rclcpp_action::Client<Navigate>;
+using SaveMap = nav2_msgs::srv::SaveMap;
+using PoseStamped = geometry_msgs::msg::PoseStamped;
+using OccupancyGrid = nav_msgs::msg::OccupancyGrid;
+using Marker = visualization_msgs::msg::Marker;
+
+static_assert(kFreeSpace == nav2_costmap_2d::FREE_SPACE);
+static_assert(kInscribedInflatedObstacle == nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE);
+static_assert(kLethalObstacle == nav2_costmap_2d::LETHAL_OBSTACLE);
+static_assert(kNoInformation == nav2_costmap_2d::NO_INFORMATION);
+
+SteadyClock::time_point after(double seconds)
+{
+  return SteadyClock::now() + std::chrono::duration_cast<SteadyClock::duration>(
+    std::chrono::duration<double>(seconds));
+}
+
+struct Config
+{
+  SearchParams search;
+  double blacklist_duration{60.0};
+  double goal_timeout{300.0};
+  double pose_timeout{1.0};
+  double retry_delay{5.0};
+  double response_timeout{10.0};
+  double cancel_timeout{2.0};
+  double save_timeout{5.0};
+  double save_retry{2.0};
 };
 
-int main(int argc, char *argv[]) {
-    rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<AutoMapper>());
-    rclcpp::shutdown();
-    return 0;
+template<class Visitor>
+void config_parameters(Config & config, Visitor visit)
+{
+  visit("min_frontier_length_m", config.search.min_length);
+  visit("min_distance_to_frontier_m", config.search.min_distance);
+  visit("max_distance_to_frontier_m", config.search.max_distance);
+  visit("frontier_size_weight", config.search.score.size_weight);
+  visit("frontier_distance_weight", config.search.score.distance_weight);
+  visit("frontier_distance_cap_m", config.search.score.distance_cap_m);
+  visit("forward_weight", config.search.score.forward_weight);
+  visit("min_free_threshold", config.search.min_free_neighbors);
+  visit("goal_clearance_radius_m", config.search.clearance_radius);
+  visit("robot_radius_m", config.search.robot_radius);
+  visit("seed_search_radius_m", config.search.seed_search_radius);
+  visit("blacklist_radius_m", config.search.blacklist_radius);
+  visit("blacklist_duration_sec", config.blacklist_duration);
+  visit("goal_timeout_sec", config.goal_timeout);
+  visit("pose_timeout_sec", config.pose_timeout);
+  visit("retry_delay_sec", config.retry_delay);
+  visit("action_response_timeout_sec", config.response_timeout);
+  visit("cancel_timeout_sec", config.cancel_timeout);
+  visit("save_timeout_sec", config.save_timeout);
+  visit("save_retry_sec", config.save_retry);
 }
+
+std::string validate_config(const Config & config)
+{
+  const auto search_error = validate_search_params(config.search);
+  if (!search_error.empty()) {return search_error;}
+  const std::array<double, 8> durations = {
+    config.blacklist_duration, config.goal_timeout, config.pose_timeout, config.retry_delay,
+    config.response_timeout, config.cancel_timeout, config.save_timeout, config.save_retry};
+  for (double duration : durations) {
+    if (!std::isfinite(duration) || duration < 0.0 || duration > 1e6) {
+      return "durations must be finite and in [0, 1000000] seconds";
+    }
+  }
+  if (config.pose_timeout == 0.0 || config.response_timeout == 0.0 ||
+    config.cancel_timeout == 0.0 || config.save_timeout == 0.0 || config.save_retry == 0.0)
+  {
+    return "pose, response, cancellation, and save timeouts/retries must be positive";
+  }
+  return {};
+}
+
+bool apply_parameters(Config & config, const std::vector<rclcpp::Parameter> & parameters)
+{
+  bool changed = false;
+  config_parameters(config, [&](const char * name, auto & field) {
+      for (const auto & parameter : parameters) {
+        if (parameter.get_name() != name) {continue;}
+        if constexpr (std::is_integral_v<std::decay_t<decltype(field)>>) {
+          const auto value = parameter.as_int();
+          if (value < 1 || value > 8) {
+            throw std::invalid_argument("min_free_threshold must be in [1, 8]");
+          }
+          field = static_cast<int>(value);
+        } else {
+          field = parameter.as_double();
+        }
+        changed = true;
+      }
+  });
+  return changed;
+}
+
+bool normalize_pose(geometry_msgs::msg::Pose & pose)
+{
+  auto & p = pose.position;
+  auto & q = pose.orientation;
+  if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+    !std::isfinite(q.x) || !std::isfinite(q.y) || !std::isfinite(q.z) || !std::isfinite(q.w))
+  {
+    return false;
+  }
+  const double length = std::hypot(std::hypot(q.x, q.y), std::hypot(q.z, q.w));
+  if (!std::isfinite(length) || length < 1e-6) {return false;}
+  q.x /= length; q.y /= length; q.z /= length; q.w /= length;
+  return true;
+}
+
+bool valid_frame(const std::string & frame)
+{
+  return !frame.empty() && frame.front() != '/' &&
+         frame.find_first_of(" \t\r\n") == std::string::npos;
+}
+
+rclcpp::NodeOptions executor_clock_options(rclcpp::NodeOptions options)
+{
+  // Search never blocks the node executor, so /clock can share it with the
+  // mission callbacks. This also avoids starting a private clock executor in
+  // the base constructor before startup parameters have been validated.
+  options.use_clock_thread(false);
+  return options;
+}
+}  // namespace
+
+class AutoMapper::Impl
+{
+public:
+  explicit Impl(AutoMapper & node)
+  : node_(node)
+  {
+    const auto map_topic = read_only<std::string>("map_topic", "map");
+    const auto odom_topic = read_only<std::string>("odom_topic", "localization/odometry/odom");
+    const auto pose_topic = read_only<std::string>("pose_topic", "");
+    navigation_action_ = read_only<std::string>("navigation_action", "navigate_to_pose");
+    const auto save_service = read_only<std::string>("map_saver_service", "map_saver/save_map");
+    map_path_ = read_only<std::string>("map_path", "/tmp/maps");
+    enabled_ = read_only<bool>("start_enabled", true);
+    startup_delay_ = read_only<double>("startup_delay_sec", 0.0);
+    const int64_t max_cells = read_only<int64_t>("max_map_cells", 16000000);
+    const auto durability = read_only<std::string>("map_durability", "transient_local");
+    const auto map_reliability = read_only<std::string>("map_reliability", "reliable");
+    const auto pose_reliability = read_only<std::string>("pose_reliability", "best_effort");
+    if (map_topic.empty() || (odom_topic.empty() && pose_topic.empty()) ||
+      navigation_action_.empty() || save_service.empty() || map_path_.empty())
+    {
+      throw std::invalid_argument(
+          "map, navigation, saver, output path and at least one pose source are required");
+    }
+    if (!std::isfinite(startup_delay_) || startup_delay_ < 0.0 || startup_delay_ > 1e6 ||
+      max_cells <= 0 || static_cast<uint64_t>(max_cells) >= std::numeric_limits<uint32_t>::max())
+    {
+      throw std::invalid_argument("invalid startup_delay_sec or max_map_cells");
+    }
+    max_map_cells_ = static_cast<std::size_t>(max_cells);
+    config_parameters(config_, [&](const char * name, auto & field) {
+        using Type = std::decay_t<decltype(field)>;
+        if constexpr (std::is_integral_v<Type>) {
+          const auto value = node_.declare_parameter<int64_t>(name, field);
+          if (value < 1 || value > 8) {
+            throw std::invalid_argument("min_free_threshold must be in [1, 8]");
+          }
+          field = static_cast<Type>(value);
+        } else {
+          field = node_.declare_parameter<Type>(name, field);
+        }
+    });
+    const auto error = validate_config(config_);
+    if (!error.empty()) {throw std::invalid_argument(error);}
+    use_sim_time_ = node_.get_parameter("use_sim_time").as_bool();
+
+    parameter_validator_ = node_.add_on_set_parameters_callback(
+      [this](const std::vector<rclcpp::Parameter> & parameters) {
+        rcl_interfaces::msg::SetParametersResult result;
+        try {
+          auto candidate = config_;
+          apply_parameters(candidate, parameters);
+          result.reason = validate_config(candidate);
+          result.successful = result.reason.empty();
+        } catch (const std::exception & exception) {
+          result.successful = false;
+          result.reason = exception.what();
+        }
+        return result;
+      });
+    parameter_applier_ = node_.add_post_set_parameters_callback(
+      [this](const std::vector<rclcpp::Parameter> & parameters) {
+        if (apply_parameters(config_, parameters)) {
+          ++config_revision_;
+          invalidate_search();
+        }
+        for (const auto & parameter : parameters) {
+          if (parameter.get_name() == "use_sim_time" && parameter.as_bool() != use_sim_time_) {
+            use_sim_time_ = parameter.as_bool();
+            clock_changed_ = true;
+          }
+        }
+      });
+
+    rclcpp::QoS map_qos(1);
+    if (durability == "transient_local") {
+      map_qos.transient_local();
+    } else if (durability != "volatile") {throw std::invalid_argument("invalid map_durability");}
+    set_reliability(map_qos, map_reliability);
+    rclcpp::QoS pose_qos(1);
+    set_reliability(pose_qos, pose_reliability);
+    map_subscription_ = node_.create_subscription<OccupancyGrid>(
+      map_topic, map_qos,
+      [this](OccupancyGrid::ConstSharedPtr message) {
+        receive_map(std::move(message));
+      });
+    if (!odom_topic.empty()) {
+      odom_subscription_ = node_.create_subscription<nav_msgs::msg::Odometry>(
+        odom_topic, pose_qos, [this](nav_msgs::msg::Odometry::ConstSharedPtr message) {
+          PoseStamped pose;
+          pose.header = message->header;
+          pose.pose = message->pose.pose;
+          receive_pose(std::move(pose), odom_pose_);
+        });
+    }
+    if (!pose_topic.empty()) {
+      pose_subscription_ = node_.create_subscription<PoseStamped>(
+        pose_topic, pose_qos, [this](PoseStamped::ConstSharedPtr message) {
+          receive_pose(*message, alternative_pose_);
+        });
+    }
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(node_.get_clock());
+    // Use this node's executor; transform queries below never block waiting for TF.
+    tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, &node_, false);
+    markers_ = node_.create_publisher<visualization_msgs::msg::MarkerArray>("frontiers", 1);
+    navigator_ = rclcpp_action::create_client<Navigate>(&node_, navigation_action_);
+    saver_ = node_.create_client<SaveMap>(save_service);
+    enable_service_ = node_.create_service<std_srvs::srv::SetBool>(
+      "~/set_enabled", [this](
+        const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+        std::shared_ptr<std_srvs::srv::SetBool::Response> response)
+      {
+        const bool changed = enabled_ != request->data;
+        enabled_ = request->data;
+        if (changed) {
+          invalidate_search();
+          if (!enabled_) {
+            request_cancel();
+            publish_markers({});
+          } else {
+            next_explore_ = node_.now().seconds();
+          }
+        }
+        response->success = true;
+        response->message =
+        enabled_ ? "exploration enabled" :
+        "exploration disabled; owned goal cancellation requested";
+      });
+    worker_ = std::make_unique<SearchWorker>();
+    // Wall polling keeps cancellation/service cleanup responsive when simulation
+    // is paused. Mission deadlines and blacklist expiry use node_.now() only.
+    timer_ = node_.create_wall_timer(std::chrono::milliseconds(50), [this] {tick();});
+    RCLCPP_INFO(node_.get_logger(), "Exploration %s; waiting asynchronously for map, pose and Nav2",
+      enabled_ ? "enabled" : "disabled");
+  }
+
+  ~Impl()
+  {
+    timer_.reset();
+    worker_.reset();  // Cooperative stop and join before releasing snapshot storage.
+    if (goal_ && goal_->handle && rclcpp::ok(node_.get_node_base_interface()->get_context())) {
+      try {navigator_->async_cancel_goal(goal_->handle);} catch (const std::exception &) {}
+    }
+    if (save_request_) {saver_->remove_pending_request(save_request_->id);}
+    navigator_.reset();
+  }
+
+private:
+  template<class T>
+  T read_only(const char * name, const T & value)
+  {
+    rcl_interfaces::msg::ParameterDescriptor descriptor;
+    descriptor.read_only = true;
+    descriptor.description = "Set at construction; restart the node to change this parameter.";
+    return node_.declare_parameter<T>(name, value, descriptor);
+  }
+
+  static void set_reliability(rclcpp::QoS & qos, const std::string & reliability)
+  {
+    if (reliability == "best_effort") {qos.best_effort();} else if (reliability == "reliable") {
+      qos.reliable();
+    } else {throw std::invalid_argument("reliability must be reliable or best_effort");}
+  }
+
+  void invalidate_search()
+  {
+    if (worker_) {worker_->cancel();}
+    planning_id_.reset();
+    last_search_.reset();
+  }
+
+  void receive_map(OccupancyGrid::ConstSharedPtr message)
+  {
+    auto origin = message->info.origin;
+    if (!valid_frame(message->header.frame_id) || !normalize_pose(origin)) {
+      RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 5000,
+        "Rejected map with invalid frame or origin pose");
+      return;
+    }
+    const auto & q = origin.orientation;
+    // A rotated XY grid is supported. A tilted grid cannot represent a planar
+    // Nav2 surface without resampling, so reject roll/pitch explicitly.
+    if (std::abs(q.x) > 1e-6 || std::abs(q.y) > 1e-6) {
+      RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 5000,
+        "Rejected nonplanar OccupancyGrid origin");
+      return;
+    }
+    GridGeometry geometry{message->info.width, message->info.height, message->info.resolution,
+      origin.position.x, origin.position.y, yaw_from_quaternion(q.x, q.y, q.z, q.w)};
+    const auto error = validate_grid(geometry, message->data, max_map_cells_);
+    if (!error.empty()) {
+      RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 5000,
+        "Rejected OccupancyGrid: %s", error.c_str());
+      return;
+    }
+    if (!map_frame_.empty() && message->header.frame_id != map_frame_) {
+      reset_mission(node_.now().seconds(), false);
+    }
+    if (grid_ && map_frame_ == message->header.frame_id && grid_->geometry == geometry &&
+      *grid_->data == message->data)
+    {
+      return;  // Header-only republishing does not invalidate an exhausted-map cache.
+    }
+    map_frame_ = message->header.frame_id;
+    auto storage = std::shared_ptr<const std::vector<int8_t>>(message, &message->data);
+    grid_ = std::make_shared<const Grid>(Grid{geometry, std::move(storage)});
+    ++map_revision_;
+    // Let an active search finish. Its approach path is checked against this
+    // newer grid before dispatch; a high-rate publisher cannot starve planning.
+  }
+
+  void receive_pose(PoseStamped pose, std::optional<PoseStamped> & destination)
+  {
+    if (pose.header.stamp.sec < 0 || pose.header.stamp.nanosec >= 1000000000u) {
+      RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 5000,
+        "Rejected pose with invalid timestamp fields");
+      return;
+    }
+    const double stamp = rclcpp::Time(pose.header.stamp).seconds();
+    if (!valid_frame(pose.header.frame_id) || stamp <= 0.0 || !normalize_pose(pose.pose)) {
+      RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 5000,
+        "Rejected pose with invalid frame, timestamp or numeric values");
+      return;
+    }
+    if (destination && stamp < rclcpp::Time(destination->header.stamp).seconds()) {return;}
+    destination = std::move(pose);
+  }
+
+  std::optional<Pose2> map_pose(double time)
+  {
+    for (const auto * source : {&odom_pose_, &alternative_pose_}) {
+      if (!*source) {continue;}
+      const auto & pose = **source;
+      const double age = time - rclcpp::Time(pose.header.stamp).seconds();
+      if (age < -0.1 || age > config_.pose_timeout) {continue;}
+      PoseStamped transformed;
+      try {
+        if (pose.header.frame_id == map_frame_) {transformed = pose;} else {
+          transformed = tf_buffer_->transform(pose, map_frame_, tf2::durationFromSec(0.0));
+        }
+      } catch (const tf2::TransformException & error) {
+        RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 5000,
+          "Waiting for pose transform into '%s': %s", map_frame_.c_str(), error.what());
+        continue;
+      }
+      if (!normalize_pose(transformed.pose)) {continue;}
+      const auto & p = transformed.pose.position;
+      const auto & q = transformed.pose.orientation;
+      return Pose2{{p.x, p.y}, yaw_from_quaternion(q.x, q.y, q.z, q.w)};
+    }
+    return std::nullopt;
+  }
+
+  void reset_mission(double time, bool clear_pose)
+  {
+    ++mission_epoch_;
+    request_cancel();
+    invalidate_search();
+    blacklist_.clear();
+    ++blacklist_revision_;
+    if (clear_pose) {odom_pose_.reset(); alternative_pose_.reset();}
+    grid_.reset();
+    has_navigated_ = false;
+    exhausted_ = false;
+    exhaustion_saved_ = false;
+    ++exhaustion_episode_;
+    save_wanted_ = false;
+    save_for_exhaustion_ = false;
+    requested_exhaustion_episode_.reset();
+    if (save_request_) {saver_->remove_pending_request(save_request_->id); save_request_.reset();}
+    ++save_generation_;
+    mission_initialized_ = time > 0.0;
+    next_explore_ = time + startup_delay_;
+    last_time_ = time;
+    publish_markers({});
+  }
+
+  struct SearchKey
+  {
+    uint64_t map, config, blacklist;
+    uint32_t cell;
+    int heading;
+    bool operator==(const SearchKey & other) const
+    {
+      return map == other.map && config == other.config && blacklist == other.blacklist &&
+             cell == other.cell && heading == other.heading;
+    }
+  };
+
+  void tick()
+  {
+    const double time = node_.now().seconds();
+    if (clock_changed_ || (mission_initialized_ && time < last_time_)) {
+      clock_changed_ = false;
+      reset_mission(time, true);
+    }
+    if (!mission_initialized_ && time > 0.0) {
+      mission_initialized_ = true;
+      next_explore_ = time + startup_delay_;
+    }
+    last_time_ = time;
+    update_goal(time);
+    update_save();
+    if (!mission_initialized_ || !enabled_ || goal_ || time < next_explore_ || !grid_) {return;}
+    const auto robot = map_pose(time);
+    if (!robot) {return;}
+    const std::size_t previous_size = blacklist_.size();
+    prune_blacklist(blacklist_, time, config_.blacklist_duration);
+    if (blacklist_.size() != previous_size) {++blacklist_revision_; invalidate_search();}
+    if (planning_id_) {
+      auto completion = worker_->poll();
+      if (!completion) {return;}
+      if (completion->job.id != *planning_id_) {return;}
+      planning_id_.reset();
+      if (!completion->error.empty()) {
+        RCLCPP_ERROR(node_.get_logger(), "Frontier search failed: %s", completion->error.c_str());
+        last_search_.reset();
+        next_explore_ = time + config_.retry_delay;
+        return;
+      }
+      auto & result = completion->result;
+      if (result.canceled) {last_search_.reset(); return;}
+      if (!result.valid_seed) {return;}
+      if (result.selected) {
+        const auto validation_deadline = after(0.01);
+        if (!path_still_valid(result, *completion->job.grid, *grid_, *robot, config_.search,
+          [validation_deadline] {return SteadyClock::now() >= validation_deadline;}))
+        {
+          last_search_.reset();
+          return;
+        }
+        exhausted_ = false;
+        exhaustion_saved_ = false;
+        publish_markers(result.frontiers);
+        send_goal(*result.selected, *robot, time);
+        return;
+      }
+      publish_markers({});
+      if (result.frontier_count == 0 && completion->job.map_revision == map_revision_) {
+        if (!exhausted_) {exhausted_ = true; exhaustion_saved_ = false; ++exhaustion_episode_;}
+        if (has_navigated_ && !exhaustion_saved_) {want_save(true);}
+      } else if (result.frontier_count > 0) {
+        exhausted_ = false;
+        exhaustion_saved_ = false;
+      }
+    }
+    if (!navigator_->action_server_is_ready()) {
+      RCLCPP_INFO_THROTTLE(node_.get_logger(), *node_.get_clock(), 5000,
+        "Waiting for navigation action server");
+      return;
+    }
+    const auto cell = grid_->geometry.world_to_cell(robot->position);
+    if (!cell) {return;}
+    const SearchKey key{map_revision_, config_revision_, blacklist_revision_, *cell,
+      static_cast<int>(std::floor(robot->yaw / 0.2))};
+    if (last_search_ && *last_search_ == key) {return;}
+    SearchJob job;
+    job.map_revision = map_revision_;
+    job.grid = grid_;
+    job.robot = *robot;
+    job.params = config_.search;
+    job.blacklist = blacklist_;
+    planning_id_ = worker_->submit(std::move(job));
+    last_search_ = key;
+  }
+
+  enum class GoalPhase {Sending, Active, Canceling};
+  struct ActiveGoal
+  {
+    uint64_t generation{0};
+    uint64_t epoch{0};
+    GoalPhase phase{GoalPhase::Sending};
+    GoalHandle::SharedPtr handle;
+    Frontier frontier;
+    double started{0.0};
+    SteadyClock::time_point response_deadline;
+    SteadyClock::time_point cancel_deadline;
+    SteadyClock::time_point cancel_retry;
+    bool cancel_requested{false};
+    bool cancel_sent{false};
+    bool cancel_confirmed{false};
+    bool terminal_confirmed{false};
+    bool blacklisted{false};
+  };
+
+  void blacklist_goal()
+  {
+    if (!goal_ || goal_->blacklisted || goal_->epoch != mission_epoch_) {return;}
+    goal_->blacklisted = true;
+    const auto & f = goal_->frontier;
+    blacklist_rejected_goal(blacklist_, f.goal.x, f.goal.y, f.boundary.x, f.boundary.y,
+      node_.now().seconds());
+    constexpr std::size_t max_entries = 1024;
+    if (blacklist_.size() > max_entries) {
+      blacklist_.erase(blacklist_.begin(), blacklist_.begin() + (blacklist_.size() - max_entries));
+    }
+    ++blacklist_revision_;
+  }
+
+  void send_goal(const Frontier & frontier, Pose2 robot, double time)
+  {
+    if (!enabled_ || goal_ || !navigator_->action_server_is_ready()) {last_search_.reset(); return;}
+    ActiveGoal state;
+    state.generation = ++goal_generation_;
+    state.epoch = mission_epoch_;
+    state.frontier = frontier;
+    state.started = time;
+    state.response_deadline = after(config_.response_timeout);
+    state.cancel_retry = SteadyClock::now();
+    goal_ = state;
+    Navigate::Goal message;
+    message.pose.header.frame_id = map_frame_;
+    message.pose.header.stamp = node_.now();
+    message.pose.pose.position.x = frontier.goal.x;
+    message.pose.pose.position.y = frontier.goal.y;
+    const double yaw = frontier_goal_yaw(frontier.goal.x, frontier.goal.y,
+      frontier.boundary.x, frontier.boundary.y, robot.position.x, robot.position.y, robot.yaw);
+    message.pose.pose.orientation.z = std::sin(yaw / 2.0);
+    message.pose.pose.orientation.w = std::cos(yaw / 2.0);
+    const auto generation = state.generation;
+    std::weak_ptr<Navigator> sending_client = navigator_;
+    Navigator::SendGoalOptions options;
+    options.goal_response_callback = [this, generation,
+        sending_client](GoalHandle::SharedPtr handle) {
+        if (!goal_ || goal_->generation != generation) {
+          if (handle) {
+            if (auto client = sending_client.lock()) {
+              try {client->async_cancel_goal(handle);} catch (const std::exception &) {}
+            }
+          }
+          return;
+        }
+        if (!handle) {
+          const bool current_mission = goal_->epoch == mission_epoch_;
+          goal_.reset();
+          if (current_mission) {
+            next_explore_ = std::max(next_explore_, node_.now().seconds() + config_.retry_delay);
+          }
+          last_search_.reset();
+          publish_markers({});
+          return;
+        }
+        goal_->handle = std::move(handle);
+        goal_->phase = GoalPhase::Active;
+        if (goal_->epoch == mission_epoch_) {has_navigated_ = true;}
+        if (!enabled_ || goal_->cancel_requested || goal_->epoch != mission_epoch_) {
+          request_cancel();
+        }
+      };
+    options.feedback_callback = [this, generation](
+      GoalHandle::SharedPtr, const std::shared_ptr<const Navigate::Feedback> feedback)
+      {
+        if (!goal_ || goal_->generation != generation) {return;}
+        RCLCPP_INFO_THROTTLE(node_.get_logger(), *node_.get_clock(), 5000,
+          "Distance remaining: %.2f m", feedback->distance_remaining);
+      };
+    options.result_callback = [this, generation](const GoalHandle::WrappedResult & result) {
+        if (!goal_ || goal_->generation != generation ||
+          (goal_->handle && goal_->handle->get_goal_id() != result.goal_id)) {return;}
+        const bool current_mission = goal_->epoch == mission_epoch_;
+        if (current_mission && !goal_->cancel_requested) {
+          if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
+            want_save(false);
+          } else if (result.code == rclcpp_action::ResultCode::ABORTED) {blacklist_goal();}
+        }
+        goal_.reset();
+        publish_markers({});
+        invalidate_search();
+        if (current_mission) {
+          next_explore_ = std::max(next_explore_, node_.now().seconds() + config_.retry_delay);
+        }
+      };
+    try {
+      navigator_->async_send_goal(message, options);
+      RCLCPP_INFO(node_.get_logger(), "Navigating to frontier approach (%.2f, %.2f)",
+        frontier.goal.x, frontier.goal.y);
+    } catch (const std::exception & error) {
+      RCLCPP_ERROR(node_.get_logger(), "Failed to send goal: %s", error.what());
+      retire_goal();
+    }
+  }
+
+  void request_cancel()
+  {
+    if (!goal_) {return;}
+    goal_->cancel_requested = true;
+    if (!goal_->handle || goal_->cancel_sent || SteadyClock::now() < goal_->cancel_retry) {return;}
+    goal_->phase = GoalPhase::Canceling;
+    goal_->cancel_sent = true;
+    goal_->cancel_deadline = after(config_.cancel_timeout);
+    const auto generation = goal_->generation;
+    const auto id = goal_->handle->get_goal_id();
+    try {
+      navigator_->async_cancel_goal(goal_->handle,
+        [this, generation, id](Navigator::CancelResponse::SharedPtr response) {
+          if (!goal_ || goal_->generation != generation) {return;}
+          const bool accepted = std::any_of(
+            response->goals_canceling.begin(), response->goals_canceling.end(),
+            [&id](const auto & info) {return info.goal_id.uuid == id;});
+          goal_->terminal_confirmed =
+          response->return_code == Navigator::CancelResponse::ERROR_GOAL_TERMINATED ||
+          response->return_code == Navigator::CancelResponse::ERROR_UNKNOWN_GOAL_ID;
+          if (accepted || goal_->terminal_confirmed) {
+            goal_->cancel_confirmed = true;
+            goal_->cancel_deadline = after(config_.cancel_timeout);
+          } else {
+            // A rejected cancel leaves the owned goal active. Do not issue a
+            // replacement; retry only after this request has returned.
+            goal_->cancel_sent = false;
+            goal_->cancel_retry = after(config_.cancel_timeout);
+          }
+        });
+    } catch (const std::exception & error) {
+      goal_->cancel_sent = false;
+      goal_->cancel_retry = after(config_.cancel_timeout);
+      RCLCPP_WARN(node_.get_logger(), "Cancellation request failed: %s", error.what());
+    }
+  }
+
+  void retire_goal()
+  {
+    // Called by the scheduler, outside client callbacks. Replacing the client
+    // releases unanswered action requests as well as stopping old callbacks.
+    const bool current_mission = goal_ && goal_->epoch == mission_epoch_;
+    ++goal_generation_;
+    goal_.reset();
+    navigator_ = rclcpp_action::create_client<Navigate>(&node_, navigation_action_);
+    invalidate_search();
+    publish_markers({});
+    if (current_mission) {
+      next_explore_ = std::max(next_explore_, node_.now().seconds() + config_.retry_delay);
+    }
+  }
+
+  void update_goal(double time)
+  {
+    if (!goal_) {return;}
+    const auto real_time = SteadyClock::now();
+    if (!navigator_->action_server_is_ready() && real_time >= goal_->response_deadline) {
+      blacklist_goal();
+      retire_goal();
+      return;
+    }
+    if (goal_->phase == GoalPhase::Sending && real_time >= goal_->response_deadline) {
+      // With a still-discovered server the request might yet be accepted. Keep
+      // its one bounded pending response so a late acceptance can be canceled.
+      goal_->cancel_requested = true;
+      RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 5000,
+        "Waiting for outstanding goal response before replacing the goal");
+    }
+    if (config_.goal_timeout > 0.0 && time >= goal_->started + config_.goal_timeout &&
+      !goal_->cancel_requested)
+    {
+      blacklist_goal();
+      request_cancel();
+    }
+    if (!enabled_ || goal_->epoch != mission_epoch_ ||
+      (goal_->phase == GoalPhase::Active && !map_pose(time)))
+    {
+      request_cancel();
+    }
+    if (goal_->cancel_requested) {request_cancel();}
+    if (goal_->cancel_confirmed && real_time >= goal_->cancel_deadline) {
+      const auto status = goal_->handle->get_status();
+      using Status = action_msgs::msg::GoalStatus;
+      if (goal_->terminal_confirmed || status == Status::STATUS_CANCELED ||
+        status == Status::STATUS_SUCCEEDED || status == Status::STATUS_ABORTED)
+      {
+        retire_goal();
+      } else {
+        // CANCELING is an active ROS action state. Acceptance of cancellation
+        // alone does not authorize dispatching a replacement goal.
+        RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 5000,
+          "Cancellation accepted; waiting for navigation to finish stopping");
+      }
+    }
+  }
+
+  struct SaveRequest
+  {
+    int64_t id;
+    uint64_t generation;
+    uint64_t ticket;
+    uint64_t epoch;
+    uint64_t episode;
+    bool exhaustion;
+    SteadyClock::time_point deadline;
+  };
+
+  void want_save(bool exhaustion)
+  {
+    if (exhaustion) {
+      if (exhaustion_saved_ || requested_exhaustion_episode_ == exhaustion_episode_) {return;}
+      requested_exhaustion_episode_ = exhaustion_episode_;
+    }
+    ++save_ticket_;
+    save_wanted_ = true;
+    save_for_exhaustion_ = save_for_exhaustion_ || exhaustion;
+  }
+
+  void update_save()
+  {
+    const auto real_time = SteadyClock::now();
+    if (save_request_ && real_time >= save_request_->deadline) {
+      saver_->remove_pending_request(save_request_->id);
+      save_request_.reset();
+      ++save_generation_;
+      next_save_ = after(config_.save_retry);
+      RCLCPP_WARN(node_.get_logger(), "Map save timed out; request removed and retry scheduled");
+    }
+    if (!save_wanted_ || save_request_ || real_time < next_save_ || !saver_->service_is_ready()) {
+      return;
+    }
+    auto request = std::make_shared<SaveMap::Request>();
+    request->map_topic = map_subscription_->get_topic_name();
+    request->map_url = map_path_;
+    request->image_format = "pgm";
+    request->map_mode = "trinary";
+    const auto generation = ++save_generation_;
+    const auto ticket = save_ticket_;
+    try {
+      auto future = saver_->async_send_request(request,
+          [this, generation](rclcpp::Client<SaveMap>::SharedFuture response) {
+            if (!save_request_ || save_request_->generation != generation) {return;}
+            const auto completed = *save_request_;
+            save_request_.reset();
+            bool success = false;
+            try {success = response.get()->result;} catch (const std::exception &) {}
+            if (success && completed.epoch == mission_epoch_) {
+              if (completed.exhaustion && exhausted_ && completed.episode == exhaustion_episode_) {
+                exhaustion_saved_ = true;
+              }
+              if (completed.ticket == save_ticket_) {
+                save_wanted_ = false;
+                save_for_exhaustion_ = false;
+              }
+              RCLCPP_INFO(node_.get_logger(), "Map saved to %s", map_path_.c_str());
+            } else {
+              RCLCPP_WARN(node_.get_logger(), "Map save failed; retry scheduled");
+            }
+            next_save_ = after(config_.save_retry);
+        });
+      save_request_ = SaveRequest{future.request_id, generation, ticket, mission_epoch_,
+        exhaustion_episode_, save_for_exhaustion_, after(config_.save_timeout)};
+    } catch (const std::exception & error) {
+      next_save_ = after(config_.save_retry);
+      RCLCPP_WARN(node_.get_logger(), "Map save request failed: %s", error.what());
+    }
+  }
+
+  void publish_markers(const std::vector<Frontier> & frontiers)
+  {
+    if (!markers_) {return;}
+    visualization_msgs::msg::MarkerArray message;
+    Marker clear;
+    clear.header.frame_id = map_frame_.empty() ? "map" : map_frame_;
+    clear.header.stamp = node_.now();
+    clear.ns = "frontiers";
+    clear.action = Marker::DELETEALL;
+    message.markers.push_back(clear);
+    int32_t id = 0;
+    for (const auto & frontier : frontiers) {
+      Marker marker;
+      marker.header = clear.header;
+      marker.ns = "frontiers";
+      marker.id = id++;
+      marker.type = Marker::SPHERE;
+      marker.action = Marker::ADD;
+      marker.pose.position.x = frontier.goal.x;
+      marker.pose.position.y = frontier.goal.y;
+      marker.pose.orientation.w = 1.0;
+      marker.scale.x = marker.scale.y = marker.scale.z = 0.3;
+      marker.color.g = marker.color.a = 1.0;
+      message.markers.push_back(std::move(marker));
+    }
+    markers_->publish(message);
+  }
+
+  AutoMapper & node_;
+  Config config_;
+  std::string navigation_action_, map_path_, map_frame_;
+  std::size_t max_map_cells_{0};
+  double startup_delay_{0.0};
+  bool enabled_{true};
+  bool mission_initialized_{false};
+  bool clock_changed_{false};
+  bool use_sim_time_{false};
+  double last_time_{0.0};
+  double next_explore_{0.0};
+  uint64_t mission_epoch_{0};
+  uint64_t map_revision_{0}, config_revision_{0}, blacklist_revision_{0};
+  std::shared_ptr<const Grid> grid_;
+  std::optional<PoseStamped> odom_pose_, alternative_pose_;
+  std::vector<BlacklistEntry> blacklist_;
+  std::optional<SearchKey> last_search_;
+  std::optional<uint64_t> planning_id_;
+  std::unique_ptr<SearchWorker> worker_;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
+  Navigator::SharedPtr navigator_;
+  std::optional<ActiveGoal> goal_;
+  uint64_t goal_generation_{0};
+  bool has_navigated_{false};
+  bool exhausted_{false}, exhaustion_saved_{false};
+  uint64_t exhaustion_episode_{0};
+  std::optional<uint64_t> requested_exhaustion_episode_;
+  bool save_wanted_{false}, save_for_exhaustion_{false};
+  uint64_t save_generation_{0}, save_ticket_{0};
+  SteadyClock::time_point next_save_ = SteadyClock::now();
+  std::optional<SaveRequest> save_request_;
+  rclcpp::Client<SaveMap>::SharedPtr saver_;
+  rclcpp::Subscription<OccupancyGrid>::SharedPtr map_subscription_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
+  rclcpp::Subscription<PoseStamped>::SharedPtr pose_subscription_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr markers_;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr enable_service_;
+  rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_validator_;
+  rclcpp::node_interfaces::PostSetParametersCallbackHandle::SharedPtr parameter_applier_;
+};
+
+AutoMapper::AutoMapper(const rclcpp::NodeOptions & options)
+: rclcpp::Node("auto_mapper", executor_clock_options(options)),
+  impl_(std::make_unique<Impl>(*this))
+{}
+
+AutoMapper::~AutoMapper() = default;
+
+}  // namespace auto_mapper
