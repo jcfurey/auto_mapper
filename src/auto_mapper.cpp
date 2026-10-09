@@ -75,6 +75,8 @@ struct Config
 {
   SearchParams search;
   double blacklist_duration{60.0};
+  // Failures near one place before it is blacklisted for the mission; 0 never.
+  double max_goal_failures{0.0};
   double goal_timeout{300.0};
   double pose_timeout{1.0};
   double retry_delay{5.0};
@@ -100,6 +102,7 @@ void config_parameters(Config & config, Visitor visit)
   visit("seed_search_radius_m", config.search.seed_search_radius);
   visit("blacklist_radius_m", config.search.blacklist_radius);
   visit("blacklist_duration_sec", config.blacklist_duration);
+  visit("max_goal_failures", config.max_goal_failures);
   visit("goal_timeout_sec", config.goal_timeout);
   visit("pose_timeout_sec", config.pose_timeout);
   visit("retry_delay_sec", config.retry_delay);
@@ -120,6 +123,12 @@ std::string validate_config(const Config & config)
     if (!std::isfinite(duration) || duration < 0.0 || duration > 1e6) {
       return "durations must be finite and in [0, 1000000] seconds";
     }
+  }
+  if (!std::isfinite(config.max_goal_failures) || config.max_goal_failures < 0.0 ||
+    config.max_goal_failures > 1000.0 ||
+    config.max_goal_failures != std::floor(config.max_goal_failures))
+  {
+    return "max_goal_failures must be a whole number in [0, 1000]";
   }
   if (config.pose_timeout == 0.0 || config.response_timeout == 0.0 ||
     config.cancel_timeout == 0.0 || config.save_timeout == 0.0 || config.save_retry == 0.0)
@@ -440,6 +449,7 @@ private:
     request_cancel();
     invalidate_search();
     blacklist_.clear();
+    failure_history_.clear();
     ++blacklist_revision_;
     if (clear_pose) {odom_pose_.reset(); alternative_pose_.reset();}
     grid_.reset();
@@ -571,8 +581,22 @@ private:
     if (!goal_ || goal_->blacklisted || goal_->epoch != mission_epoch_) {return;}
     goal_->blacklisted = true;
     const auto & f = goal_->frontier;
+    const double now = node_.now().seconds();
+    // A place that keeps failing (e.g. an unreachable frontier) would otherwise
+    // be retried each time its blacklist entry expires, and never let the
+    // mission reach exhaustion.
+    const auto failures = count_failures(failure_history_, f.goal.x, f.goal.y,
+        config_.search.blacklist_radius);
+    const bool permanent = config_.max_goal_failures > 0.0 &&
+      static_cast<double>(failures) >= config_.max_goal_failures;
+    failure_history_.push_back({f.goal.x, f.goal.y, now});
+    if (failure_history_.size() > 1024) {failure_history_.erase(failure_history_.begin());}
+    if (permanent) {
+      RCLCPP_WARN(node_.get_logger(), "Frontier near (%.2f, %.2f) failed %zu times; skipping it",
+        f.goal.x, f.goal.y, failures);
+    }
     blacklist_rejected_goal(blacklist_, f.goal.x, f.goal.y, f.boundary.x, f.boundary.y,
-      node_.now().seconds());
+      now, permanent);
     constexpr std::size_t max_entries = 1024;
     if (blacklist_.size() > max_entries) {
       blacklist_.erase(blacklist_.begin(), blacklist_.begin() + (blacklist_.size() - max_entries));
@@ -730,6 +754,17 @@ private:
       goal_->cancel_requested = true;
       RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 5000,
         "Waiting for outstanding goal response before replacing the goal");
+      // A response lost for good would stall exploration for the node's life.
+      // After another full deadline give up on it: a server that accepted it
+      // late preempts or rejects the next goal, so goals still can't overlap.
+      if (real_time >= goal_->response_deadline +
+        std::chrono::duration_cast<SteadyClock::duration>(
+          std::chrono::duration<double>(config_.response_timeout)))
+      {
+        RCLCPP_WARN(node_.get_logger(), "Goal response lost; replacing the goal");
+        retire_goal();
+        return;
+      }
     }
     if (config_.goal_timeout > 0.0 && time >= goal_->started + config_.goal_timeout &&
       !goal_->cancel_requested)
@@ -875,6 +910,7 @@ private:
   std::shared_ptr<const Grid> grid_;
   std::optional<PoseStamped> odom_pose_, alternative_pose_;
   std::vector<BlacklistEntry> blacklist_;
+  std::vector<BlacklistEntry> failure_history_;
   std::optional<SearchKey> last_search_;
   std::optional<uint64_t> planning_id_;
   std::unique_ptr<SearchWorker> worker_;

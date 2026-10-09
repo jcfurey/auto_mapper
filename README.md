@@ -141,6 +141,7 @@ positive.
 | `seed_search_radius_m` | `1.0` | Recovery radius for an invalid robot seed cell. |
 | `blacklist_radius_m` | `1.0` | Exclusion radius around failed goals and boundary points. |
 | `blacklist_duration_sec` | `60.0` | ROS-time lifetime; at most 1024 entries retained. |
+| `max_goal_failures` | `0` | Failures near one place before it is blacklisted for the rest of the mission; 0 never. |
 | `goal_timeout_sec` | `300.0` | ROS-time deadline to cancel/blacklist an overdue goal; 0 disables. |
 | `pose_timeout_sec` | `1.0` | Maximum ROS-time pose age. |
 | `retry_delay_sec` | `5.0` | ROS-time backoff after a goal finishes or is rejected. |

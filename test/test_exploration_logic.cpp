@@ -260,6 +260,20 @@ TEST(Blacklist, RejectedGoalBlocksBothGoalAndCentroid)
     auto_mapper::is_blacklisted(entries, centroid_x, centroid_y, kBlacklistRadius));
 }
 
+TEST(Blacklist, PermanentEntriesSurviveExpiryAndFailuresAccumulate)
+{
+  std::vector<BlacklistEntry> entries;
+  auto_mapper::blacklist_rejected_goal(entries, 1.0, 1.0, 1.0, 1.0, 0.0, true);
+  auto_mapper::blacklist_rejected_goal(entries, 9.0, 9.0, 9.0, 9.0, 0.0);
+  auto_mapper::prune_blacklist(entries, 1000.0, 60.0);
+  ASSERT_EQ(entries.size(), 1u);
+  EXPECT_TRUE(entries[0].permanent);
+
+  const std::vector<BlacklistEntry> history = {{0.0, 0.0, 0.0}, {0.5, 0.0, 70.0}, {5.0, 5.0, 80.0}};
+  EXPECT_EQ(auto_mapper::count_failures(history, 0.2, 0.0, 1.0), 3u);
+  EXPECT_EQ(auto_mapper::count_failures(history, 20.0, 0.0, 1.0), 1u);
+}
+
 TEST(Blacklist, RejectedGoalDedupesUndisplacedCentroid)
 {
   // When refinement did not move the goal, one entry is enough.

@@ -171,6 +171,8 @@ struct BlacklistEntry
   double y;
   // Seconds on the caller's mission clock (ROS time in the node).
   double when;
+  // Kept until the mission resets: the place failed too often to retry.
+  bool permanent{false};
 };
 
 /// True if (x, y) lies strictly within radius_m of any blacklist entry.
@@ -194,12 +196,27 @@ inline void blacklist_rejected_goal(
   std::vector<BlacklistEntry> & entries,
   double goal_x, double goal_y,
   double boundary_x, double boundary_y,
-  double now)
+  double now, bool permanent = false)
 {
-  entries.push_back({goal_x, goal_y, now});
+  entries.push_back({goal_x, goal_y, now, permanent});
   if (goal_x != boundary_x || goal_y != boundary_y) {
-    entries.push_back({boundary_x, boundary_y, now});
+    entries.push_back({boundary_x, boundary_y, now, permanent});
   }
+}
+
+/// Failures recorded within radius_m of (x, y), the new one included. Failure
+/// history outlives blacklist expiry, so a place that keeps failing is noticed.
+inline std::size_t count_failures(
+  const std::vector<BlacklistEntry> & history,
+  double x, double y, double radius_m)
+{
+  return 1 + static_cast<std::size_t>(std::count_if(
+    history.begin(), history.end(),
+           [x, y, radius_m](const BlacklistEntry & entry) {
+             const double dx = x - entry.x;
+             const double dy = y - entry.y;
+             return dx * dx + dy * dy < radius_m * radius_m;
+    }));
 }
 
 /// Drop expired entries and entries from before a backward mission-clock jump.
@@ -211,7 +228,7 @@ inline void prune_blacklist(
     std::remove_if(
       entries.begin(), entries.end(),
       [now, duration_sec](const BlacklistEntry & e) {
-        return now < e.when || now - e.when > duration_sec;
+        return !e.permanent && (now < e.when || now - e.when > duration_sec);
       }),
     entries.end());
 }
